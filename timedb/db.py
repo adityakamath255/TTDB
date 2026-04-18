@@ -35,23 +35,6 @@ class TimeDB:
     def latest(self) -> Snapshot:
         return Snapshot(self._log, len(self._log.events) - 1)
 
-    def seq_at(self, at: datetime) -> int:
-        if not self._log.events:
-            raise ValueError("database is empty")
-        if self._log.events[0].timestamp > at:
-            return -1
-        else:
-            return bisect_right(
-                self._log.events, 
-                at, 
-                key=lambda e: e.timestamp
-            ) - 1
-
-    def timestamp_at(self, seq: int) -> datetime:
-        if seq < 0 or seq >= len(self._log.events):
-            raise ValueError(f"no event at seq {seq}")
-        return self._log.events[seq].timestamp
-
     def events(self) -> Iterator[Event]:
         return iter(self._log.events)
 
@@ -92,12 +75,6 @@ class TimeDB:
                         raise ValueError(
                             f"line {line_num}: "
                             f"expected seq {len(events)}, got {event.seq}"
-                        )
-                    if events and event.timestamp < events[-1].timestamp:
-                        raise ValueError(
-                            f"line {line_num}: "
-                            f"timestamp {event.timestamp} precedes previous "
-                            f"{events[-1].timestamp}"
                         )
 
                 events.append(event)

@@ -19,9 +19,6 @@ class Snapshot:
         else:
             return self._log.events[self._through].timestamp
 
-    def exists(self, key: str) -> bool:
-        return self.get(key) is not ABSENT
-
     def keys(self) -> Iterator[str]:
         return (key for key, _ in self.items())
 
@@ -31,8 +28,11 @@ class Snapshot:
             if value is not ABSENT:
                 yield key, value
 
-    def len(self) -> int:
-        return sum(1 for _ in self.keys())
+    def __len__(self) -> int:
+        return sum(1 for _ in self.items())
+
+    def __contains__(self, key: str) -> bool:
+        return self.get(key) is not ABSENT
 
     def __repr__(self) -> str:
         return f"Snapshot(seq={self._through})"

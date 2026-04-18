@@ -13,12 +13,6 @@ class Log:
             self.index.setdefault(event.key, []).append(event.seq)
 
     def append(self, key: str, value: Any, at: datetime) -> int:
-        if self.events and at < self.events[-1].timestamp:
-            raise ValueError(
-                f"timestamp {at} precedes last event at "
-                f"{self.events[-1].timestamp}"
-            )
-
         event = Event(len(self.events), key, value, at)
         self.events.append(event)
         self.index.setdefault(key, []).append(event.seq)

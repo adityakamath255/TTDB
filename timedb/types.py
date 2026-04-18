@@ -1,6 +1,6 @@
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any
+from typing import Any, Iterator
 
 
 class _Absent:
@@ -38,3 +38,31 @@ def validate_value(value: Any):
             f"value of type {type(value).__name__} "
             f"is not JSON-serializable"
         )
+
+
+@dataclass(slots=True)
+class Log:
+    events: list[Event]
+    seq: int
+
+    def append(self, key: str, value: Any, at: datetime) -> int:
+        if self.events and at < self.events[-1].timestamp:
+            raise ValueError(
+                f"timestamp {at} precedes last event at "
+                f"{self.events[-1].timestamp}"
+            )
+
+        event = Event(self.seq, key, value, at)
+        self.events.append(event)
+        self.seq += 1
+        return event.seq
+
+    def resolve(self, key: str, through: int) -> Any:
+        for i in range(through, -1, -1):
+            if self.events[i].key == key:
+                return self.events[i].value
+        else:
+            return ABSENT
+
+    def history(self, key: str) -> Iterator[Event]:
+        return (e for e in self.events if e.key == key)

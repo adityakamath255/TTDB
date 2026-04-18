@@ -41,6 +41,16 @@ class TimeDB:
     def history(self, key: str) -> Iterator[Event]:
         return self._log.history(key)
 
+    def between(self, seq0: int, seq1: int) -> Iterator[Event]:
+        n = len(self._log.events)
+
+        if not (-1 <= seq0 <= seq1 < n):
+            raise ValueError(
+                f"invalid range: seq0={seq0}, seq1={seq1}, log has {n} events"
+            )
+
+        return (self._log.events[i] for i in range(seq0 + 1, seq1 + 1))
+
     def save(self, path: str | Path):
         with open(path, "w") as f:
             for event in self._log.events:

@@ -8,25 +8,42 @@ from .log import Log
 class Snapshot:
     def __init__(self, log: Log, through: int):
         self._log = log
-        self._through = through
+        self.seq = through
 
     def get(self, key: str) -> Any:
-        return self._log.resolve(key, self._through)
+        return self._log.resolve(key, self.seq)
 
     def timestamp(self) -> Optional[datetime]:
-        if self._through < 0:
+        if self.seq < 0:
             return None
         else:
-            return self._log.events[self._through].timestamp
+            return self._log.events[self.seq].timestamp
 
     def keys(self) -> Iterator[str]:
         return (key for key, _ in self.items())
 
     def items(self) -> Iterator[tuple[str, Any]]:
         for key in self._log.index:
-            value = self._log.resolve(key, self._through)
+            value = self._log.resolve(key, self.seq)
             if value is not ABSENT:
                 yield key, value
+
+    def diff(self, other: "Snapshot") -> dict[str, tuple[Any, Any]]:
+        if self._log is not other._log:
+            raise ValueError("cannot diff across logs")
+
+        lo, hi = sorted((self.seq, other.seq))
+        seen = {e.key for e in self._log.events[lo + 1: hi + 1]}
+
+        res = {}
+
+        for key in seen:
+            a = self._log.resolve(key, self.seq)
+            b = self._log.resolve(key, other.seq)
+            if a != b:
+                res[key] = (a, b)
+
+        return res
 
     def __len__(self) -> int:
         return sum(1 for _ in self.items())
@@ -35,4 +52,4 @@ class Snapshot:
         return self.get(key) is not ABSENT
 
     def __repr__(self) -> str:
-        return f"Snapshot(seq={self._through})"
+        return f"Snapshot(seq={self.seq})"

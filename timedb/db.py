@@ -10,7 +10,7 @@ from .snapshot import Snapshot
 
 class TimeDB:
     def __init__(self):
-        self._log = Log([], 0)
+        self._log = Log([])
 
     def put(self, key: str, value: Any) -> int:
         validate_value(value)
@@ -27,12 +27,12 @@ class TimeDB:
         return self._log.append(key, ABSENT, at)
 
     def at(self, seq: int) -> Snapshot:
-        if seq >= self._log.seq:
+        if seq >= len(self._log.events):
             raise ValueError(f"no event at seq {seq}")
         return Snapshot(self._log, seq)
 
     def latest(self) -> Snapshot:
-        return Snapshot(self._log, self._log.seq - 1)
+        return Snapshot(self._log, len(self._log.events) - 1)
 
     def seq_at(self, at: datetime) -> int:
         if not self._log.events:
@@ -47,7 +47,7 @@ class TimeDB:
             ) - 1
 
     def timestamp_at(self, seq: int) -> datetime:
-        if seq < 0 or seq >= self._log.seq:
+        if seq < 0 or seq >= len(self._log.events):
             raise ValueError(f"no event at seq {seq}")
         return self._log.events[seq].timestamp
 
@@ -71,7 +71,6 @@ class TimeDB:
     @classmethod
     def _load_impl(cls, path: str | Path, check: bool) -> "TimeDB":
         events = []
-        seq = 0
 
         with open(path) as f:
             for line_num, line in enumerate(f, 1):
@@ -88,10 +87,10 @@ class TimeDB:
                 )
 
                 if check:
-                    if event.seq != seq:
+                    if event.seq != len(events):
                         raise ValueError(
                             f"line {line_num}: "
-                            f"expected seq {seq}, got {event.seq}"
+                            f"expected seq {len(events)}, got {event.seq}"
                         )
                     if events and event.timestamp < events[-1].timestamp:
                         raise ValueError(
@@ -101,10 +100,9 @@ class TimeDB:
                         )
 
                 events.append(event)
-                seq = event.seq + 1
 
         db = TimeDB()
-        db._log = Log(events, seq)
+        db._log = Log(events)
         return db
 
     @classmethod

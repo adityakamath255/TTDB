@@ -40,10 +40,9 @@ def validate_value(value: Any):
         )
 
 
-@dataclass(slots=True)
 class Log:
-    events: list[Event]
-    seq: int
+    def __init__(self, events: list[Event]):
+        self.events = events
 
     def append(self, key: str, value: Any, at: datetime) -> int:
         if self.events and at < self.events[-1].timestamp:
@@ -52,9 +51,8 @@ class Log:
                 f"{self.events[-1].timestamp}"
             )
 
-        event = Event(self.seq, key, value, at)
+        event = Event(len(self.events), key, value, at)
         self.events.append(event)
-        self.seq += 1
         return event.seq
 
     def resolve(self, key: str, through: int) -> Any:

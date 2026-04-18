@@ -4,7 +4,8 @@ from pathlib import Path
 from typing import Any, Iterator
 from bisect import bisect_right
 
-from .types import Event, Log, ABSENT, validate_value
+from .types import Event, ABSENT, validate_value
+from .log import Log
 from .snapshot import Snapshot
 
 

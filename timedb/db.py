@@ -26,28 +26,28 @@ class TimeDB:
         return self.put_at(key, ABSENT, at)
 
     def at(self, seq: int) -> Snapshot:
-        if seq >= len(self._log.events):
+        if seq >= len(self._log.events()):
             raise ValueError(f"no event at seq {seq}")
         return Snapshot(self._log, seq)
 
     def latest(self) -> Snapshot:
-        return Snapshot(self._log, len(self._log.events) - 1)
+        return Snapshot(self._log, len(self._log.events()) - 1)
 
     def events(self) -> Iterator[Event]:
-        return iter(self._log.events)
+        return iter(self._log.events())
 
     def history(self, key: str) -> Iterator[Event]:
         return self._log.history(key)
 
     def between(self, seq0: int, seq1: int) -> Iterator[Event]:
-        n = len(self._log.events)
+        n = len(self._log.events())
 
-        if not (-1 <= seq0 <= seq1 < n):
+        if not (seq0 <= seq1 < n):
             raise ValueError(
                 f"invalid range: seq0={seq0}, seq1={seq1}, log has {n} events"
             )
 
-        return (self._log.events[i] for i in range(seq0 + 1, seq1 + 1))
+        return self._log.events_between(seq0, seq1)
 
     def apply(
         self, writes: dict[str, Any]
@@ -69,7 +69,7 @@ class TimeDB:
 
     def save(self, path: str | Path):
         with open(path, "w") as f:
-            for event in self._log.events:
+            for event in self._log.events():
                 record = {
                     "seq": event.seq,
                     "key": event.key,
@@ -80,47 +80,25 @@ class TimeDB:
                 f.write(json.dumps(record) + "\n")
 
     @classmethod
-    def _load_impl(cls, path: str | Path, check: bool) -> "TimeDB":
-        events = []
-
-        with open(path) as f:
-            for line_num, line in enumerate(f, 1):
-
-                record = json.loads(line)
-
-                event = Event(
-                    seq=record["seq"],
-                    key=record["key"],
-                    value=_deserialize_value(record["value"]),
-                    timestamp=datetime.fromisoformat(
-                        record["timestamp"]
-                    ),
-                    tx_id=record["tx_id"]
+    def load(cls, path: str | Path) -> "TimeDB":
+        events = _read_events(path)
+        for i, event in enumerate(events):
+            if event.seq != i:
+                raise ValueError(
+                    f"line {i}: expected seq {i}, got {event.seq}"
                 )
-
-                if check:
-                    if event.seq != len(events):
-                        raise ValueError(
-                            f"line {line_num}: "
-                            f"expected seq {len(events)}, got {event.seq}"
-                        )
-
-                events.append(event)
-
         db = TimeDB()
         db._log = Log(events)
         return db
 
     @classmethod
-    def load(cls, path: str | Path) -> "TimeDB":
-        return cls._load_impl(path, True)
-
-    @classmethod
     def load_unchecked(cls, path: str | Path) -> "TimeDB":
-        return cls._load_impl(path, False)
+        db = TimeDB()
+        db._log = Log(_read_events(path))
+        return db
 
     def __repr__(self) -> str:
-        n = len(self._log.events)
+        n = len(self._log.events())
         return f"TimeDB({n} {'events' if n != 1 else 'event'})"
 
 
@@ -138,3 +116,17 @@ def _deserialize_value(raw: dict) -> Any:
         if raw["type"] == "absent"
         else raw["data"]
     )
+
+
+def _read_events(path: str | Path) -> list[Event]:
+    with open(path) as f:
+        return [
+            Event(
+                seq=r["seq"],
+                key=r["key"],
+                value=_deserialize_value(r["value"]),
+                timestamp=datetime.fromisoformat(r["timestamp"]),
+                tx_id=r["tx_id"],
+            )
+            for r in map(json.loads, f)
+        ]

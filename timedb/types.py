@@ -20,17 +20,20 @@ class Event:
     tx_id: Optional[int]
 
 
-def validate_value(value: Any):
-    if (
-        isinstance(value, (str, int, float, bool)) 
-        or value is None
-        or value is ABSENT
-    ):
+def _validate_impl(value: Any, internal: bool):
+    if value is ABSENT:
+        if internal:
+            raise TypeError(
+                f"value of type {type(value).__name__} "
+                f"is not JSON-serializable"
+            )
+
+    elif isinstance(value, (str, int, float, bool)) or value is None:
         pass
 
     elif isinstance(value, list):
         for item in value:
-            validate_value(item)
+            _validate_impl(item, True)
 
     elif isinstance(value, dict):
         for k, v in value.items():
@@ -39,10 +42,14 @@ def validate_value(value: Any):
                     f"dict keys must be strings, "
                     f"got {type(k).__name__}"
                 )
-            validate_value(v)
+            _validate_impl(v, True)
 
     else:
         raise TypeError(
             f"value of type {type(value).__name__} "
             f"is not JSON-serializable"
         )
+
+
+def validate_value(value: Any):
+    return _validate_impl(value, False)

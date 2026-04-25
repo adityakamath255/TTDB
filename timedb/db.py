@@ -1,7 +1,7 @@
 import json
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Iterator, Optional
+from typing import Any, Iterator, Optional, Sequence
 
 from .types import Event, ABSENT, validate_value
 from .log import Log
@@ -12,12 +12,18 @@ class TimeDB:
     def __init__(self):
         self._log = Log([])
 
+    @classmethod
+    def load(cls, path: str | Path) -> "TimeDB":
+        db = cls.__new__(cls)
+        db._log = Log(_read_events(path))
+        return db
+
     def put(self, key: str, value: Any) -> int:
         return self.put_at(key, value, datetime.now())
 
     def put_at(self, key: str, value: Any, at: datetime) -> int:
         validate_value(value)
-        return self._log.append(key, value, at, None)
+        return self._log.write(key, value, at)
 
     def delete(self, key: str) -> int:
         return self.put(key, ABSENT)
@@ -26,18 +32,15 @@ class TimeDB:
         return self.put_at(key, ABSENT, at)
 
     def at(self, seq: int) -> Snapshot:
-        if seq >= len(self._log.events()):
+        if seq >= self._log.latest():
             raise ValueError(f"no event at seq {seq}")
         return Snapshot(self._log, seq)
 
     def latest(self) -> Snapshot:
-        return Snapshot(self._log, len(self._log.events()) - 1)
+        return Snapshot(self._log, self._log.latest())
 
-    def events(self) -> Iterator[Event]:
-        return iter(self._log.events())
-
-    def history(self, key: str) -> Iterator[Event]:
-        return self._log.history(key)
+    def events(self) -> Sequence[Event]:
+        return self._log.events()
 
     def between(self, seq0: int, seq1: int) -> Iterator[Event]:
         n = len(self._log.events())
@@ -62,10 +65,15 @@ class TimeDB:
         else:
             for value in writes.values():
                 validate_value(value)
-            return self._log.append_transaction(writes, at)
+            return self._log.write_tx(writes, at)
 
     def transaction_events(self, tx_id: int) -> Iterator[Event]:
-        return self._log.transaction_events(tx_id)
+        if self._log.tx_exists(tx_id):
+            return self._log.tx_events(tx_id)
+        else:
+            raise ValueError(
+                f"Transaction {tx_id} does not exist"
+            )
 
     def save(self, path: str | Path):
         with open(path, "w") as f:
@@ -78,24 +86,6 @@ class TimeDB:
                     "tx_id": event.tx_id
                 }
                 f.write(json.dumps(record) + "\n")
-
-    @classmethod
-    def load(cls, path: str | Path) -> "TimeDB":
-        events = _read_events(path)
-        for i, event in enumerate(events):
-            if event.seq != i:
-                raise ValueError(
-                    f"line {i}: expected seq {i}, got {event.seq}"
-                )
-        db = TimeDB()
-        db._log = Log(events)
-        return db
-
-    @classmethod
-    def load_unchecked(cls, path: str | Path) -> "TimeDB":
-        db = TimeDB()
-        db._log = Log(_read_events(path))
-        return db
 
     def __repr__(self) -> str:
         n = len(self._log.events())

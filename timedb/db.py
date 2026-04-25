@@ -32,7 +32,7 @@ class TimeDB:
         return self.put_at(key, ABSENT, at)
 
     def at(self, seq: int) -> Snapshot:
-        if seq >= self._log.latest():
+        if seq > self._log.latest():
             raise ValueError(f"no event at seq {seq}")
         return Snapshot(self._log, seq)
 
@@ -43,11 +43,12 @@ class TimeDB:
         return self._log.events()
 
     def between(self, seq0: int, seq1: int) -> Iterator[Event]:
-        n = len(self._log.events())
+        n = self._log.latest()
 
-        if not (seq0 <= seq1 < n):
+        if not (seq0 <= seq1 <= n):
             raise ValueError(
-                f"invalid range: seq0={seq0}, seq1={seq1}, log has {n} events"
+                f"invalid range: seq0={seq0}, seq1={seq1}, "
+                f"log has {n + 1} events"
             )
 
         return self._log.events_between(seq0, seq1)
@@ -67,13 +68,10 @@ class TimeDB:
                 validate_value(value)
             return self._log.write_tx(writes, at)
 
-    def transaction_events(self, tx_id: int) -> Iterator[Event]:
-        if self._log.tx_exists(tx_id):
-            return self._log.tx_events(tx_id)
-        else:
-            raise ValueError(
-                f"Transaction {tx_id} does not exist"
-            )
+    def tx_events(self, tx_id: int) -> Iterator[Event]:
+        if not self._log.tx_exists(tx_id):
+            raise ValueError(f"Transaction {tx_id} does not exist")
+        return self._log.tx_events(tx_id)
 
     def save(self, path: str | Path):
         with open(path, "w") as f:
@@ -83,7 +81,8 @@ class TimeDB:
                     "key": event.key,
                     "value": _serialize_value(event.value),
                     "timestamp": event.timestamp.isoformat(),
-                    "tx_id": event.tx_id
+                    "tx_id": event.tx_id,
+                    "prev_seq": event.prev_seq
                 }
                 f.write(json.dumps(record) + "\n")
 
@@ -117,6 +116,7 @@ def _read_events(path: str | Path) -> list[Event]:
                 value=_deserialize_value(r["value"]),
                 timestamp=datetime.fromisoformat(r["timestamp"]),
                 tx_id=r["tx_id"],
+                prev_seq=r["prev_seq"]
             )
             for r in map(json.loads, f)
         ]

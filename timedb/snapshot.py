@@ -9,12 +9,13 @@ class Snapshot:
     def __init__(self, log: Log, through: int):
         self._log = log
         self._seq = through
+        self._root = log.root_at(through)
 
     def seq(self) -> int:
         return self._seq
 
     def get(self, key: str) -> Any:
-        return self._log.resolve(key, self._seq)
+        return self._root.get(key, ABSENT)
 
     def timestamp(self) -> Optional[datetime]:
         if event := self._log.get(self._seq):
@@ -23,14 +24,18 @@ class Snapshot:
             return None
 
     def keys(self) -> Iterator[str]:
-        return (key for key, _ in self.items())
+        return iter(self._root)
 
     def items(self) -> Iterator[tuple[str, Any]]:
-        return self._log.items(self._seq)
+        return iter(self._root.items())
 
     def diff(self, other: "Snapshot") -> Iterator[tuple[str, Any, Any]]:
-        lo, hi = sorted((self._seq, other._seq))
-        return self._log.diff(lo, hi)
+        lo, hi = self._root, other._root
+        for k in set(lo) | set(hi):
+            lo_val = lo.get(k, ABSENT)
+            hi_val = hi.get(k, ABSENT)
+            if lo_val != hi_val:
+                yield (k, lo_val, hi_val)
 
     def __contains__(self, key: str) -> bool:
         return self.get(key) is not ABSENT

@@ -18,6 +18,7 @@ class Event:
     value: Any
     timestamp: datetime
     tx_id: Optional[int]
+    prev_seq: Optional[int]
 
 
 def _validate_impl(value: Any, internal: bool):

@@ -1,38 +1,68 @@
 from typing import Any, Optional, Iterator, Sequence
 from threading import Lock
 from datetime import datetime
-from bisect import bisect_right
+
+import immutables
 
 from .types import Event, ABSENT
 
 
+_EMPTY = immutables.Map()
+
+
 class Log:
     def __init__(self, events: list[Event]):
-        self._events = events
-        self._index: dict[str, list[int]] = {}
+        self._events: list[Event] = []
+        self._roots: list[immutables.Map] = []
+        self._latest_per_key: dict[str, int] = {}
         self._lock = Lock()
-        for event in events:
-            self._index.setdefault(event.key, []).append(event.seq)
+        for e in events:
+            self._publish(e.key, e.value, e.timestamp, e.tx_id)
 
-    def _append(self, event: Event):
-        self._events.append(event)
-        self._index.setdefault(event.key, []).append(event.seq)
+    def _publish(
+        self, key: str, value: Any, at: datetime, tx_id: Optional[int]
+    ) -> int:
+        if self._roots:
+            prev_root = self._roots[-1] 
+        else:
+            prev_root = _EMPTY
+
+        prev_seq = self._latest_per_key.get(key)
+        seq = len(self._events)
+
+        if value is ABSENT:
+            if key in prev_root:
+                new_root = prev_root.delete(key) 
+            else:
+                new_root = prev_root
+        else:
+            new_root = prev_root.set(key, value)
+
+        self._events.append(Event(seq, key, value, at, tx_id, prev_seq))
+        self._roots.append(new_root)
+        self._latest_per_key[key] = seq
+
+        return seq
 
     def write(self, key: str, value: Any, at: datetime) -> int:
         with self._lock:
-            event = Event(len(self._events), key, value, at, None)
-            self._append(event)
-            return event.seq
+            return self._publish(key, value, at, None)
 
     def write_tx(
         self, writes: dict[str, Any], at: datetime
     ) -> tuple[int, int]:
         with self._lock:
             tx_id = len(self._events)
+            last_seq = tx_id
             for key, value in writes.items():
-                event = Event(len(self._events), key, value, at, tx_id)
-                self._append(event)
-            return (tx_id, self._events[-1].seq)
+                last_seq = self._publish(key, value, at, tx_id)
+            return (tx_id, last_seq)
+
+    def root_at(self, seq: int) -> immutables.Map:
+        if seq < 0:
+            return _EMPTY
+        else:
+            return self._roots[seq]
 
     def get(self, seq: int) -> Optional[Event]:
         if seq < 0:
@@ -45,6 +75,10 @@ class Log:
 
     def events_between(self, lo: int, hi: int) -> Iterator[Event]:
         return (self._events[i] for i in range(max(0, lo), hi + 1))
+
+    def latest(self) -> int:
+        with self._lock:
+            return len(self._events) - 1
 
     def tx_exists(self, tx_id: int) -> bool:
         return (
@@ -61,47 +95,12 @@ class Log:
             yield self._events[i]
             i += 1
 
-    def resolve(self, key: str, through: int) -> Any:
-        seqs = self._index.get(key, ())
-        idx = bisect_right(seqs, through) - 1
-        if idx < 0:
-            return ABSENT
-        else:
-            return self._events[seqs[idx]].value
-
-    def latest(self) -> int:
-        with self._lock:
-            return len(self._events) - 1
-
-    def items(self, through: int) -> Iterator[tuple[str, Any]]:
-        seen: set[str] = set()
-
-        for ix in range(through, -1, -1):
-            event = self._events[ix]
-            
-            if event.key not in seen:
-                seen.add(event.key)
-
-                if event.value is not ABSENT:
-                    yield (event.key, event.value)
-
     def history(self, key: str, lo: int, hi: int) -> Iterator[Event]:
-        return (
-            self._events[ix] 
-            for ix in self._index.get(key, ())
-            if lo < ix <= hi
-        )
-
-    def diff(self, lo: int, hi: int) -> Iterator[tuple[str, Any, Any]]:
-        lo = max(-1, lo)
-        seen: set[str] = set()
-
-        for ix in range(hi, lo, -1):
-            event = self._events[ix]
-
-            if event.key not in seen:
-                seen.add(event.key)
-                prev_val = self.resolve(event.key, lo)
-
-                if event.value != prev_val:
-                    yield (event.key, prev_val, event.value)
+        chain: list[Event] = []
+        seq = self._latest_per_key.get(key)
+        while seq is not None and seq > hi:
+            seq = self._events[seq].prev_seq
+        while seq is not None and seq > lo:
+            chain.append(self._events[seq])
+            seq = self._events[seq].prev_seq
+        return reversed(chain)

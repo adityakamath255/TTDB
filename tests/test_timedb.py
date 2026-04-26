@@ -317,25 +317,25 @@ def test_transaction_events_contiguous():
 
     assert (tx1, last1) == (0, 1)
     assert (tx2, last2) == (3, 5)
-    assert [e.key for e in db.transaction_events(tx1)] == ["a", "b"]
-    assert [e.key for e in db.transaction_events(tx2)] == ["c", "d", "e"]
+    assert [e.key for e in db.tx_events(tx1)] == ["a", "b"]
+    assert [e.key for e in db.tx_events(tx2)] == ["c", "d", "e"]
 
 @pytest.mark.parametrize("bad_id", [-1, 999])
 def test_transaction_events_unknown_id_raises(bad_id):
     db = make_db(("x", 1, T0))
     with pytest.raises(ValueError):
-        db.transaction_events(bad_id)
+        db.tx_events(bad_id)
 
 def test_transaction_events_on_singleton_seq_raises():
     db = make_db(("x", 1, T0))
     with pytest.raises(ValueError):
-        db.transaction_events(0)
+        db.tx_events(0)
 
 def test_transaction_events_on_non_first_tx_seq_raises():
     db = TimeDB()
     db.apply_at({"x": 1, "y": 2, "z": 3}, T0)
     with pytest.raises(ValueError):
-        db.transaction_events(1)
+        db.tx_events(1)
 
 
 # -- validation --
@@ -396,7 +396,7 @@ def test_load_preserves_tx_id(tmp_path):
     assert events[0].tx_id is None
     assert events[1].tx_id == 1
     assert events[2].tx_id == 1
-    assert [e.key for e in loaded.transaction_events(1)] == ["x", "y"]
+    assert [e.key for e in loaded.tx_events(1)] == ["x", "y"]
 
 def test_save_and_load_nested_values(tmp_path):
     db = make_db(("x", {"a": [1, 2, {"b": True}]}, T0))
@@ -404,6 +404,19 @@ def test_save_and_load_nested_values(tmp_path):
     db.save(path)
     loaded = TimeDB.load(path)
     assert loaded.latest().get("x") == {"a": [1, 2, {"b": True}]}
+
+def test_save_appends_incrementally(tmp_path):
+    path = tmp_path / "db.jsonl"
+    db = TimeDB()
+    db.put_at("x", 1, T0)
+    db.save(path)
+    size1 = path.stat().st_size
+    db.put_at("y", 2, T1)
+    db.save(path)
+    size2 = path.stat().st_size
+    assert size2 > size1
+    loaded = TimeDB.load(path)
+    assert dict(loaded.latest().items()) == {"x": 1, "y": 2}
 
 
 # -- repr --

@@ -74,7 +74,7 @@ class Log:
         return self._events
 
     def events_between(self, lo: int, hi: int) -> Iterator[Event]:
-        return (self._events[i] for i in range(max(0, lo), hi + 1))
+        return (self._events[i] for i in range(max(0, lo + 1), hi + 1))
 
     def latest(self) -> int:
         with self._lock:

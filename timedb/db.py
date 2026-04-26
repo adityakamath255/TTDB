@@ -9,35 +9,73 @@ from .snapshot import Snapshot
 from . import segment
 
 
-class TimeDB:
-    def __init__(self):
-        self._log = Log([])
-        self._persisted_path: Optional[Path] = None
-        self._persisted_seq: int = -1
-        self._save_lock = Lock()
+DEFAULT_SEGMENT_BYTES = 64 * 1024 * 1024
+_MANIFEST_NAME = "manifest"
 
-    @classmethod
-    def load(cls, path: str | Path) -> "TimeDB":
-        db = cls.__new__(cls)
-        db._log = Log(segment.read_events(path))
-        db._persisted_path = Path(path).resolve()
-        db._persisted_seq = db._log.latest()
-        db._save_lock = Lock()
-        return db
+
+class TimeDB:
+    def __init__(
+        self, path: str | Path, *, segment_bytes: int = DEFAULT_SEGMENT_BYTES
+    ):
+        directory = Path(path)
+        if not directory.is_dir():
+            raise ValueError(f"not a directory: {directory}")
+        manifest = segment.read_manifest(directory / _MANIFEST_NAME)
+
+        events: list[Event] = []
+        for seg in manifest["segments"]:
+            seg_events = segment.read_events(directory / seg["filename"])
+            if len(seg_events) != seg["event_count"]:
+                raise ValueError(
+                    f"segment {seg['filename']}: manifest says "
+                    f"{seg['event_count']} events, file has {len(seg_events)}"
+                )
+            events.extend(seg_events)
+
+        self._log = Log(events)
+        self._save_lock = Lock()
+        self._segments = manifest["segments"]
+        self._segment_bytes = segment_bytes
 
     def save(self, path: str | Path):
         with self._save_lock:
-            resolved = Path(path).resolve()
-            latest = self._log.latest()
-            tail = self._log.events()[self._persisted_seq + 1:]
+            directory = Path(path)
+            directory.mkdir(parents=True, exist_ok=True)
 
-            if self._persisted_path == resolved:
-                segment.append_events(resolved, tail)
+            sealed = [s for s in self._segments if s["sealed"]]
+
+            if sealed:
+                first_unsealed_seq = sealed[-1]["last_seq"]
             else:
-                segment.write_events(resolved, self._log.events())
+                first_unsealed_seq = 0
 
-            self._persisted_path = resolved
-            self._persisted_seq = latest
+            if not self._segments:
+                next_num = -1
+            elif self._segments[-1]["sealed"]:
+                next_num = _segment_num(self._segments[-1]["filename"]) + 1
+            else:
+                next_num = _segment_num(self._segments[-1]["filename"])
+
+            to_write = self.events()[first_unsealed_seq:]
+            chunks = segment.bin_events_by_size(to_write, self._segment_bytes)
+
+            new_segments = []
+            for i, chunk in enumerate(chunks):
+                filename = f"{next_num + i:06d}.log"
+                segment.atomic_write_events(directory / filename, chunk)
+                new_segments.append({
+                    "filename": filename,
+                    "first_seq": chunk[0].seq,
+                    "last_seq": chunk[-1].seq,
+                    "event_count": len(chunk),
+                    "sealed": i < len(chunks) - 1,
+                })
+
+            all_segments = sealed + new_segments
+            segment.write_manifest(
+                directory / _MANIFEST_NAME, {"segments": all_segments}
+            )
+            self._segments = all_segments
 
     def put(self, key: str, value: Any) -> int:
         return self.put_at(key, value, datetime.now())
@@ -97,3 +135,7 @@ class TimeDB:
     def __repr__(self) -> str:
         n = len(self._log.events())
         return f"TimeDB({n} {'events' if n != 1 else 'event'})"
+
+
+def _segment_num(filename: str) -> int:
+    return int(filename.split(".")[0])

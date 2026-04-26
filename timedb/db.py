@@ -1,4 +1,3 @@
-import json
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterator, Optional, Sequence
@@ -7,6 +6,7 @@ from threading import Lock
 from .types import Event, ABSENT, validate_value
 from .log import Log
 from .snapshot import Snapshot
+from . import segment
 
 
 class TimeDB:
@@ -19,7 +19,7 @@ class TimeDB:
     @classmethod
     def load(cls, path: str | Path) -> "TimeDB":
         db = cls.__new__(cls)
-        db._log = Log(_read_events(path))
+        db._log = Log(segment.read_events(path))
         db._persisted_path = Path(path).resolve()
         db._persisted_seq = db._log.latest()
         db._save_lock = Lock()
@@ -29,23 +29,12 @@ class TimeDB:
         with self._save_lock:
             resolved = Path(path).resolve()
             latest = self._log.latest()
+            tail = self._log.events()[self._persisted_seq + 1:]
 
             if self._persisted_path == resolved:
-                start, mode = self._persisted_seq + 1, "a"
+                segment.append_events(resolved, tail)
             else:
-                start, mode = 0, "w"
-
-            with open(resolved, mode) as f:
-                for event in self._log.events()[start:]:
-                    record = {
-                        "seq": event.seq,
-                        "key": event.key,
-                        "value": _serialize_value(event.value),
-                        "timestamp": event.timestamp.isoformat(),
-                        "tx_id": event.tx_id,
-                        "prev_seq": event.prev_seq,
-                    }
-                    f.write(json.dumps(record) + "\n")
+                segment.write_events(resolved, self._log.events())
 
             self._persisted_path = resolved
             self._persisted_seq = latest
@@ -108,34 +97,3 @@ class TimeDB:
     def __repr__(self) -> str:
         n = len(self._log.events())
         return f"TimeDB({n} {'events' if n != 1 else 'event'})"
-
-
-def _serialize_value(value: Any) -> dict:
-    return (
-        {"type": "absent"}
-        if value is ABSENT
-        else {"type": "data", "data": value}
-    )
-
-
-def _deserialize_value(raw: dict) -> Any:
-    return (
-        ABSENT
-        if raw["type"] == "absent"
-        else raw["data"]
-    )
-
-
-def _read_events(path: str | Path) -> list[Event]:
-    with open(path) as f:
-        return [
-            Event(
-                seq=r["seq"],
-                key=r["key"],
-                value=_deserialize_value(r["value"]),
-                timestamp=datetime.fromisoformat(r["timestamp"]),
-                tx_id=r["tx_id"],
-                prev_seq=r["prev_seq"]
-            )
-            for r in map(json.loads, f)
-        ]

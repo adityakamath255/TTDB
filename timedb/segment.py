@@ -90,3 +90,11 @@ def write_manifest(path: str | Path, manifest: dict):
         json.dump(manifest, f)
         f.write("\n")
     os.replace(tmp, path)
+
+
+def segment_filenname(num: int) -> str:
+    return f"{num:06d}.log"
+
+
+def segment_num(filename: str) -> int:
+    return int(filename.split(".")[0])

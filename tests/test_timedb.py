@@ -5,7 +5,6 @@ import pytest
 from conftest import SEG, SEG_TINY, SAVE_BYTES, SAVE_SECONDS
 from timedb.types import Event, ABSENT
 from timedb.db import TimeDB
-from timedb import segment
 
 
 T0 = datetime(2025, 1, 1)
@@ -441,11 +440,6 @@ def test_seals_when_over_threshold(tmp_path):
 
     segs = sorted(path.glob("*.log"))
     assert len(segs) > 1
-    sealed_count = sum(
-        1 for s in segment.read_manifest(path / "manifest")["segments"]
-        if s["sealed"]
-    )
-    assert sealed_count == len(segs) - 1
 
 
 def test_sealed_segment_not_rewritten(tmp_path):

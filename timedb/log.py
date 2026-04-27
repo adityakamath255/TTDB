@@ -1,6 +1,7 @@
-from typing import Any, Optional, Iterator, Sequence, Protocol
+from typing import Any, Optional, Iterator, Sequence, Iterable
 from threading import Lock
 from datetime import datetime
+from contextlib import nullcontext, AbstractContextManager
 
 import immutables
 
@@ -10,89 +11,59 @@ from .types import Event, ABSENT
 _EMPTY = immutables.Map()
 
 
-class LogProtocol(Protocol):
-    def write(self, key: str, value: Any, at: datetime) -> int: 
-        ...
-
-    def write_tx(self, writes: dict[str, Any], at: datetime) -> tuple[int, int]:
-        ...
-
-    def root_at(self, seq: int) -> immutables.Map:
-        ...
-
-    def get(self, seq: int) -> Optional[Event]:
-        ...
-
-    def events(self) -> Sequence[Event]:
-        ...
-
-    def events_between(self, lo: int, hi: int) -> Iterator[Event]:
-        ...
-
-    def latest(self) -> int:
-        ...
-
-    def tx_exists(self, tx_id: int) -> bool:
-        ...
-
-    def tx_events(self, tx_id: int) -> Iterator[Event]:
-        ...
-
-    def history(self, key: str, lo: int, hi: int) -> Iterator[Event]:
-        ...
-
-    def flush(self):
-        ...
-
-    def __enter__(self) -> "LogProtocol":
-        ...
-
-    def __exit__(self, *exc) -> bool:
-        ...
-
-
-class Log(LogProtocol):
-    def __init__(self, events: list[Event]):
+class Log:
+    def __init__(self, listener: AbstractContextManager):
+        self._listener = listener
         self._events: list[Event] = []
         self._roots: list[immutables.Map] = []
         self._latest_per_key: dict[str, int] = {}
         self._lock = Lock()
+
+    @classmethod
+    def in_memory(cls) -> "Log":
+        return cls(nullcontext())
+
+    def attach(self, listener: AbstractContextManager):
+        self._listener = listener
+
+    def replay(self, events: Iterable[Event]):
         for e in events:
-            self._publish(e.key, e.value, e.timestamp, e.tx_id)
+            self._index(e)
+
+    def _index(self, event: Event):
+        prev_root = self._roots[-1] if self._roots else _EMPTY
+        if event.value is not ABSENT:
+            new_root = prev_root.set(event.key, event.value)
+        elif event.key in prev_root:
+            new_root = prev_root.delete(event.key)
+        else:
+            new_root = prev_root
+        self._events.append(event)
+        self._roots.append(new_root)
+        self._latest_per_key[event.key] = event.seq
 
     def _publish(
         self, key: str, value: Any, at: datetime, tx_id: Optional[int]
     ) -> int:
-        if self._roots:
-            prev_root = self._roots[-1] 
-        else:
-            prev_root = _EMPTY
-
-        prev_seq = self._latest_per_key.get(key)
-        seq = len(self._events)
-
-        if value is ABSENT:
-            if key in prev_root:
-                new_root = prev_root.delete(key) 
-            else:
-                new_root = prev_root
-        else:
-            new_root = prev_root.set(key, value)
-
-        self._events.append(Event(seq, key, value, at, tx_id, prev_seq))
-        self._roots.append(new_root)
-        self._latest_per_key[key] = seq
-
-        return seq
+        event = Event(
+            seq=len(self._events),
+            key=key,
+            value=value,
+            timestamp=at,
+            tx_id=tx_id,
+            prev_seq=self._latest_per_key.get(key),
+        )
+        self._index(event)
+        return event.seq
 
     def write(self, key: str, value: Any, at: datetime) -> int:
-        with self._lock:
+        with self._listener, self._lock:
             return self._publish(key, value, at, None)
 
     def write_tx(
         self, writes: dict[str, Any], at: datetime
     ) -> tuple[int, int]:
-        with self._lock:
+        with self._listener, self._lock:
             tx_id = len(self._events)
             last_seq = tx_id
             for key, value in writes.items():
@@ -100,16 +71,10 @@ class Log(LogProtocol):
             return (tx_id, last_seq)
 
     def root_at(self, seq: int) -> immutables.Map:
-        if seq < 0:
-            return _EMPTY
-        else:
-            return self._roots[seq]
+        return _EMPTY if seq < 0 else self._roots[seq]
 
     def get(self, seq: int) -> Optional[Event]:
-        if seq < 0:
-            return None
-        else:
-            return self._events[seq]
+        return None if seq < 0 else self._events[seq]
 
     def events(self) -> Sequence[Event]:
         return self._events
@@ -129,28 +94,6 @@ class Log(LogProtocol):
 
     def tx_events(self, tx_id: int) -> Iterator[Event]:
         i = tx_id
-        while (
-            i < len(self._events)
-            and self._events[i].tx_id == tx_id
-        ):
+        while i < len(self._events) and self._events[i].tx_id == tx_id:
             yield self._events[i]
             i += 1
-
-    def history(self, key: str, lo: int, hi: int) -> Iterator[Event]:
-        chain: list[Event] = []
-        seq = self._latest_per_key.get(key)
-        while seq is not None and seq > hi:
-            seq = self._events[seq].prev_seq
-        while seq is not None and seq > lo:
-            chain.append(self._events[seq])
-            seq = self._events[seq].prev_seq
-        return reversed(chain)
-
-    def flush(self):
-        pass
-
-    def __enter__(self) -> "Log":
-        return self
-
-    def __exit__(self, *exc) -> bool:
-        return False

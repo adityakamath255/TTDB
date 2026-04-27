@@ -2,11 +2,11 @@ from typing import Optional, Any, Iterator
 from datetime import datetime
 
 from .types import ABSENT
-from .log import LogProtocol
+from .log import Log
 
 
 class Snapshot:
-    def __init__(self, log: LogProtocol, through: int):
+    def __init__(self, log: Log, through: int):
         self._log = log
         self._seq = through
         self._root = log.root_at(through)

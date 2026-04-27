@@ -18,7 +18,6 @@ class Event:
     value: Any
     timestamp: datetime
     tx_id: Optional[int]
-    prev_seq: Optional[int]
 
 
 def _validate_json(value: Any):
@@ -47,4 +46,4 @@ def _validate_json(value: Any):
 
 def validate_value(value: Any):
     if value is not ABSENT:
-        return _validate_json(value)
+        _validate_json(value)

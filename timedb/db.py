@@ -3,39 +3,45 @@ from pathlib import Path
 from typing import Any, Iterator, Optional, Sequence
 
 from .types import Event, ABSENT, validate_value
-from .log import LogProtocol, Log
-from .durable_log import DurableLog
+from .log import Log
+from .saver import Saver
 from .snapshot import Snapshot
 
 
 class TimeDB:
-    def __init__(self, log: LogProtocol):
+    def __init__(self, log: Log, saver: Optional[Saver]):
         self._log = log
+        self._saver = saver
 
     @classmethod
     def in_memory(cls) -> "TimeDB":
-        return cls(Log([]))
+        return cls(Log.in_memory(), None)
 
     @classmethod
     def open(
-        cls, 
-        path: str | Path, 
-        save_bytes: int, 
-        save_seconds: float, 
+        cls,
+        path: str | Path,
+        save_bytes: int,
+        save_seconds: float,
         segment_bytes: int,
     ) -> "TimeDB":
-        return cls(DurableLog.open(
-            Path(path), save_bytes, save_seconds, segment_bytes
-        ))
+        log = Log.in_memory()
+        saver = Saver.open(
+            log, Path(path), save_bytes, save_seconds, segment_bytes,
+        )
+        saver.start()
+        return cls(log, saver)
 
     def flush(self):
-        self._log.flush()
-        
+        if self._saver is not None:
+            self._saver.flush()
+
     def __enter__(self) -> "TimeDB":
         return self
 
-    def __exit__(self, *exc) -> bool:
-        return self._log.__exit__(*exc)
+    def __exit__(self, *exc):
+        if self._saver is not None:
+            self._saver.close()
 
     def put(self, key: str, value: Any) -> int:
         return self.put_at(key, value, datetime.now())
@@ -63,13 +69,11 @@ class TimeDB:
 
     def between(self, seq0: int, seq1: int) -> Iterator[Event]:
         n = self._log.latest()
-
         if not (seq0 <= seq1 <= n):
             raise ValueError(
                 f"invalid range: seq0={seq0}, seq1={seq1}, "
                 f"log has {n + 1} events"
             )
-
         return self._log.events_between(seq0, seq1)
 
     def apply(
@@ -82,10 +86,9 @@ class TimeDB:
     ) -> Optional[tuple[int, int]]:
         if not writes:
             return None
-        else:
-            for value in writes.values():
-                validate_value(value)
-            return self._log.write_tx(writes, at)
+        for value in writes.values():
+            validate_value(value)
+        return self._log.write_tx(writes, at)
 
     def tx_events(self, tx_id: int) -> Iterator[Event]:
         if not self._log.tx_exists(tx_id):

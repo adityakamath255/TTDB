@@ -2,7 +2,7 @@ from datetime import datetime, timedelta
 
 import pytest
 
-from conftest import SEG, SEG_TINY, SAVE_BYTES, SAVE_SECONDS
+from conftest import SEG, SEG_TINY, SAVE_EVENTS, SAVE_SECONDS
 from timedb.types import Event, ABSENT
 from timedb.db import TimeDB
 
@@ -158,26 +158,14 @@ def test_timestamp_at_seq():
 
 def test_events_returns_all():
     db = make_db(("x", 1, T0), ("y", 2, T1))
-    events = list(db.events())
-    assert events == [
-        Event(0, "x", 1, T0, None, None),
-        Event(1, "y", 2, T1, None, prev_seq_for(events, 1)),
+    assert list(db.events()) == [
+        Event(0, "x", 1, T0, None),
+        Event(1, "y", 2, T1, None),
     ]
-
-def prev_seq_for(events, ix):
-    return events[ix].prev_seq
 
 def test_singleton_put_has_no_tx_id():
     db = make_db(("x", 1, T0))
     assert list(db.events())[0].tx_id is None
-
-def test_event_prev_seq_chains_per_key():
-    db = make_db(("x", 1, T0), ("y", 2, T1), ("x", 3, T2), ("x", 4, T3))
-    events = list(db.events())
-    assert events[0].prev_seq is None
-    assert events[1].prev_seq is None
-    assert events[2].prev_seq == 0
-    assert events[3].prev_seq == 2
 
 
 # -- between --
@@ -274,9 +262,10 @@ def test_apply_returns_first_and_last_seq():
     db = make_db(("a", 0, T0), ("b", 1, T1))
     assert db.apply_at({"x": 1, "y": 2}, T2) == (2, 3)
 
-def test_apply_empty_dict_is_noop():
+def test_apply_empty_dict_raises():
     db = TimeDB.in_memory()
-    assert db.apply_at({}, T0) is None
+    with pytest.raises(ValueError):
+        db.apply_at({}, T0)
     assert list(db.events()) == []
 
 def test_apply_shares_timestamp_and_tx_id():
@@ -387,12 +376,12 @@ def test_db_repr(n, expected):
 
 def test_roundtrip(tmp_path):
     path = tmp_path / "db"
-    with TimeDB.open(path, SAVE_BYTES, SAVE_SECONDS, SEG) as db:
+    with TimeDB.open(path, SAVE_EVENTS, SAVE_SECONDS, SEG) as db:
         db.put_at("x", 1, T0)
         db.put_at("y", "hello", T1)
         db.delete_at("x", T2)
 
-    with TimeDB.open(path, SAVE_BYTES, SAVE_SECONDS, SEG) as loaded:
+    with TimeDB.open(path, SAVE_EVENTS, SAVE_SECONDS, SEG) as loaded:
         assert dict(loaded.latest().items()) == {"y": "hello"}
         assert loaded.at(0).get("x") == 1
         assert loaded.latest().get("x") is ABSENT
@@ -401,11 +390,11 @@ def test_roundtrip(tmp_path):
 
 def test_load_preserves_tx_id(tmp_path):
     path = tmp_path / "db"
-    with TimeDB.open(path, SAVE_BYTES, SAVE_SECONDS, SEG) as db:
+    with TimeDB.open(path, SAVE_EVENTS, SAVE_SECONDS, SEG) as db:
         db.put_at("a", 1, T0)
         db.apply_at({"x": 10, "y": 20}, T1)
 
-    with TimeDB.open(path, SAVE_BYTES, SAVE_SECONDS, SEG) as loaded:
+    with TimeDB.open(path, SAVE_EVENTS, SAVE_SECONDS, SEG) as loaded:
         events = list(loaded.events())
         assert events[0].tx_id is None
         assert events[1].tx_id == 1
@@ -415,26 +404,26 @@ def test_load_preserves_tx_id(tmp_path):
 
 def test_nested_values_roundtrip(tmp_path):
     path = tmp_path / "db"
-    with TimeDB.open(path, SAVE_BYTES, SAVE_SECONDS, SEG) as db:
+    with TimeDB.open(path, SAVE_EVENTS, SAVE_SECONDS, SEG) as db:
         db.put_at("x", {"a": [1, 2, {"b": True}]}, T0)
 
-    with TimeDB.open(path, SAVE_BYTES, SAVE_SECONDS, SEG) as loaded:
+    with TimeDB.open(path, SAVE_EVENTS, SAVE_SECONDS, SEG) as loaded:
         assert loaded.latest().get("x") == {"a": [1, 2, {"b": True}]}
 
 
 def test_flush_persists_without_close(tmp_path):
     path = tmp_path / "db"
-    with TimeDB.open(path, SAVE_BYTES, SAVE_SECONDS, SEG) as db:
+    with TimeDB.open(path, SAVE_EVENTS, SAVE_SECONDS, SEG) as db:
         db.put_at("x", 1, T0)
         db.flush()
 
-        with TimeDB.open(path, SAVE_BYTES, SAVE_SECONDS, SEG) as reader:
+        with TimeDB.open(path, SAVE_EVENTS, SAVE_SECONDS, SEG) as reader:
             assert reader.latest().get("x") == 1
 
 
 def test_seals_when_over_threshold(tmp_path):
     path = tmp_path / "db"
-    with TimeDB.open(path, SAVE_BYTES, SAVE_SECONDS, SEG_TINY) as db:
+    with TimeDB.open(path, SAVE_EVENTS, SAVE_SECONDS, SEG_TINY) as db:
         for i in range(50):
             db.put_at(f"k{i}", i, T0 + timedelta(seconds=i))
 
@@ -444,14 +433,14 @@ def test_seals_when_over_threshold(tmp_path):
 
 def test_sealed_segment_not_rewritten(tmp_path):
     path = tmp_path / "db"
-    with TimeDB.open(path, SAVE_BYTES, SAVE_SECONDS, SEG_TINY) as db:
+    with TimeDB.open(path, SAVE_EVENTS, SAVE_SECONDS, SEG_TINY) as db:
         for i in range(50):
             db.put_at(f"k{i}", i, T0 + timedelta(seconds=i))
 
     sealed_path = path / "000001.log"
     mtime_before = sealed_path.stat().st_mtime_ns
 
-    with TimeDB.open(path, SAVE_BYTES, SAVE_SECONDS, SEG_TINY) as db:
+    with TimeDB.open(path, SAVE_EVENTS, SAVE_SECONDS, SEG_TINY) as db:
         for i in range(50, 60):
             db.put_at(f"k{i}", i, T0 + timedelta(seconds=i))
 
@@ -461,24 +450,24 @@ def test_sealed_segment_not_rewritten(tmp_path):
 def test_multi_segment_roundtrip(tmp_path):
     path = tmp_path / "db"
     expected_events: list[Event] = []
-    with TimeDB.open(path, SAVE_BYTES, SAVE_SECONDS, SEG_TINY) as db:
+    with TimeDB.open(path, SAVE_EVENTS, SAVE_SECONDS, SEG_TINY) as db:
         for i in range(100):
             db.put_at(f"k{i}", i, T0 + timedelta(seconds=i))
         expected_events = list(db.events())
 
-    with TimeDB.open(path, SAVE_BYTES, SAVE_SECONDS, SEG_TINY) as loaded:
+    with TimeDB.open(path, SAVE_EVENTS, SAVE_SECONDS, SEG_TINY) as loaded:
         assert list(loaded.events()) == expected_events
         assert dict(loaded.latest().items()) == {f"k{i}": i for i in range(100)}
 
 
 def test_reopen_appends(tmp_path):
     path = tmp_path / "db"
-    with TimeDB.open(path, SAVE_BYTES, SAVE_SECONDS, SEG) as db:
+    with TimeDB.open(path, SAVE_EVENTS, SAVE_SECONDS, SEG) as db:
         db.put_at("x", 1, T0)
 
-    with TimeDB.open(path, SAVE_BYTES, SAVE_SECONDS, SEG) as db:
+    with TimeDB.open(path, SAVE_EVENTS, SAVE_SECONDS, SEG) as db:
         db.put_at("y", 2, T1)
 
-    with TimeDB.open(path, SAVE_BYTES, SAVE_SECONDS, SEG) as loaded:
+    with TimeDB.open(path, SAVE_EVENTS, SAVE_SECONDS, SEG) as loaded:
         assert dict(loaded.latest().items()) == {"x": 1, "y": 2}
         assert [e.seq for e in loaded.events()] == [0, 1]

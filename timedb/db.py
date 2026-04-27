@@ -21,13 +21,13 @@ class TimeDB:
     def open(
         cls,
         path: str | Path,
-        save_bytes: int,
+        save_events: int,
         save_seconds: float,
         segment_bytes: int,
     ) -> "TimeDB":
         log = Log.in_memory()
         saver = Saver.open(
-            log, Path(path), save_bytes, save_seconds, segment_bytes,
+            log, Path(path), save_events, save_seconds, segment_bytes,
         )
         saver.start()
         return cls(log, saver)
@@ -76,16 +76,14 @@ class TimeDB:
             )
         return self._log.events_between(seq0, seq1)
 
-    def apply(
-        self, writes: dict[str, Any]
-    ) -> Optional[tuple[int, int]]:
+    def apply(self, writes: dict[str, Any]) -> tuple[int, int]:
         return self.apply_at(writes, datetime.now())
 
     def apply_at(
         self, writes: dict[str, Any], at: datetime
-    ) -> Optional[tuple[int, int]]:
+    ) -> tuple[int, int]:
         if not writes:
-            return None
+            raise ValueError("apply requires a non-empty writes dict")
         for value in writes.values():
             validate_value(value)
         return self._log.write_tx(writes, at)

@@ -15,7 +15,6 @@ _MANIFEST_NAME = "manifest"
 class SegmentMeta:
     filename: str
     last_seq: int
-    event_count: int
 
 
 class Saver:
@@ -25,7 +24,7 @@ class Saver:
         directory: Path,
         sealed: list[SegmentMeta],
         active: Optional[SegmentMeta],
-        save_bytes: int,
+        save_events: int,
         save_seconds: float,
         segment_bytes: int,
     ):
@@ -33,7 +32,7 @@ class Saver:
         self._directory = directory
         self._sealed = sealed
         self._active = active
-        self._save_bytes = save_bytes
+        self._save_events = save_events
         self._save_seconds = save_seconds
         self._segment_bytes = segment_bytes
         self._persisted_through_seq = active.last_seq if active else -1
@@ -47,7 +46,7 @@ class Saver:
         cls,
         log: Log,
         directory: Path,
-        save_bytes: int,
+        save_events: int,
         save_seconds: float,
         segment_bytes: int,
     ) -> "Saver":
@@ -67,19 +66,13 @@ class Saver:
 
         events: list[Event] = []
         for seg in metas:
-            seg_events = segment.read_events(directory / seg.filename)
-            if len(seg_events) != seg.event_count:
-                raise ValueError(
-                    f"segment {seg.filename}: manifest says "
-                    f"{seg.event_count} events, file has {len(seg_events)}"
-                )
-            events.extend(seg_events)
+            events.extend(segment.read_events(directory / seg.filename))
 
         log.replay(events)
 
         saver = cls(
             log, directory, sealed, active,
-            save_bytes, save_seconds, segment_bytes,
+            save_events, save_seconds, segment_bytes,
         )
         log.attach(saver)
         return saver
@@ -97,7 +90,7 @@ class Saver:
         if exc_type is not None:
             return
         seq = self._log.latest()
-        if seq - self._persisted_through_seq >= self._save_bytes:
+        if seq - self._persisted_through_seq >= self._save_events:
             with self._wake:
                 self._wake.notify()
 
@@ -161,12 +154,11 @@ class Saver:
 
         new_segments: list[SegmentMeta] = []
         for i, chunk in enumerate(chunks):
-            filename = f"{next_num + i:06d}.log"
+            filename = segment.segment_filename(next_num + i)
             segment.atomic_write_events(self._directory / filename, chunk)
             new_segments.append(SegmentMeta(
                 filename=filename,
                 last_seq=chunk[-1].seq,
-                event_count=len(chunk),
             ))
 
         self._sealed = self._sealed + new_segments[:-1]

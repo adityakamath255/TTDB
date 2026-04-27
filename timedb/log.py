@@ -16,7 +16,6 @@ class Log:
         self._listener = listener
         self._events: list[Event] = []
         self._roots: list[immutables.Map] = []
-        self._latest_per_key: dict[str, int] = {}
         self._lock = Lock()
 
     @classmethod
@@ -40,7 +39,6 @@ class Log:
             new_root = prev_root
         self._events.append(event)
         self._roots.append(new_root)
-        self._latest_per_key[event.key] = event.seq
 
     def _publish(
         self, key: str, value: Any, at: datetime, tx_id: Optional[int]
@@ -51,7 +49,6 @@ class Log:
             value=value,
             timestamp=at,
             tx_id=tx_id,
-            prev_seq=self._latest_per_key.get(key),
         )
         self._index(event)
         return event.seq

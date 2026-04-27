@@ -1,31 +1,31 @@
 # TimeDB
 
-An append-only, in-memory key-value store for Python that retains full history. Every write is recorded as an immutable event. Past states are queryable by sequence number. Nothing is ever overwritten.
+An append-only key-value store for Python that retains full history. Every write is recorded as an immutable event. Past states are queryable by sequence number. Nothing is ever overwritten.
 
 ---
 
 ## How it works
 
-All writes go into a log as `Event` objects with a sequence number, key, value, timestamp, and optional transaction ID. The current value of any key is derived by finding the most recent event for that key at or before a given sequence number. Deletion is a write of the sentinel value `ABSENT`.
+All writes go into a log as `Event` objects with a sequence number, key, value, timestamp, and optional transaction ID. The current value of any key is read from a HAMT root snapshot at that sequence number. Deletion is a write of the sentinel value `ABSENT`.
 
-A `Snapshot` is a view of the log frozen at a specific sequence number. It resolves values on demand rather than copying them, so creating a snapshot is cheap regardless of log size.
+A `Snapshot` is a view of the log frozen at a specific sequence number. Lookups go straight through the persistent root, so creating a snapshot is cheap regardless of log size.
 
 ---
 
 ## Installation
 
-No dependencies beyond the Python standard library. Copy the package directory into your project.
+Depends on `immutables` (HAMT). Copy the `timedb` package directory into your project.
 
 ---
 
 ## Usage
 
-### Basic reads and writes
+### In-memory
 
 ```python
 from timedb import TimeDB
 
-db = TimeDB()
+db = TimeDB.in_memory()
 
 db.put("user.name", "alice")
 db.put("user.name", "bob")
@@ -34,12 +34,24 @@ snap = db.latest()
 print(snap.get("user.name"))  # "bob"
 ```
 
+### Persistent
+
+```python
+with TimeDB.open(path, save_events=1000, save_seconds=5.0,
+                 segment_bytes=64 * 1024 * 1024) as db:
+    db.put("user.name", "alice")
+```
+
+A background thread writes events to segment files in `path/`. Writes are durable up to `save_events` events / `save_seconds` seconds behind. Call `db.flush()` to block until persisted.
+
 ### Time travel
 
 ```python
 snap0 = db.at(0)
 print(snap0.get("user.name"))  # "alice"
 ```
+
+`db.at(-1)` is a snapshot before any events; everything resolves to `ABSENT`. `db.latest()` is shorthand for the snapshot at the last written event (or seq -1 if empty).
 
 ### Deletion
 
@@ -57,7 +69,7 @@ first_seq, last_seq = db.apply({
 })
 ```
 
-All keys in a single `apply` call share the same transaction ID and timestamp.
+All keys in a single `apply` call share the same transaction ID and timestamp. `apply` raises `ValueError` on an empty dict.
 
 ### Diffing snapshots
 
@@ -65,11 +77,11 @@ All keys in a single `apply` call share the same transaction ID and timestamp.
 a = db.at(0)
 b = db.latest()
 
-changes = a.diff(b)
-# {"user.name": ("alice", ABSENT), "order.id": (ABSENT, 42), ...}
+for key, lo, hi in a.diff(b):
+    print(key, lo, hi)
 ```
 
-`diff` only examines keys that appear in events between the two sequence numbers, so it does not scan the full key set.
+`diff` yields `(key, value_in_a, value_in_b)` for every key where the two snapshots disagree. `ABSENT` represents "not present in this snapshot."
 
 ### Iterating
 
@@ -77,18 +89,22 @@ changes = a.diff(b)
 for key, value in db.latest().items():
     print(key, value)
 
-for event in db.history("user.name"):
-    print(event.seq, event.value)
+for event in db.between(seq0, seq1):
+    print(event.seq, event.key, event.value)
 ```
 
-### Persistence
+`between(seq0, seq1)` yields events `(seq0, seq1]` (exclusive at the low end so it pairs naturally with `db.at(seq0)` / `db.at(seq1)`).
+
+### Transactions
+
+`apply` writes multiple keys atomically: all events share a `tx_id` equal to the seq of the first event in the group.
 
 ```python
-db.save("db.jsonl")
-db2 = TimeDB.load("db.jsonl")
+for event in db.tx_events(tx_id):
+    print(event.key, event.value)
 ```
 
-The file format is newline-delimited JSON. Each line is one event. `load` verifies that sequence numbers are contiguous; `load_unchecked` skips that check.
+Single-key writes via `put` and `delete` have `tx_id = None`.
 
 ---
 
@@ -98,28 +114,9 @@ Accepted value types are `str`, `int`, `float`, `bool`, `None`, and arbitrarily 
 
 ---
 
-## Sequence numbers
-
-Sequence numbers start at 0 and increment by one per event. `db.at(seq)` raises `ValueError` if `seq` is out of range. `db.latest()` returns a snapshot at the last written event, or a snapshot at seq -1 if the log is empty (all keys resolve to `ABSENT`).
-
----
-
-## Transactions
-
-`apply` and `apply_at` write multiple keys atomically in the sense that all events share the same `tx_id`, which equals the sequence number of the first event in the group. To retrieve all events in a transaction:
-
-```python
-for event in db.transaction_events(tx_id):
-    print(event.key, event.value)
-```
-
-Single-key writes via `put` and `delete` have `tx_id = None`.
-
----
-
 ## Limitations
 
-- No persistence layer beyond manual `save`/`load`.
-- No compaction. The log grows without bound.
-- Not thread-safe.
-- No indexing beyond per-key sequence lists.
+- Memory grows forever (no compaction).
+- Single-process. No lockfile.
+- No fsync. Segment writes go to OS page cache only.
+- Single writer at a time. Snapshot reads are concurrent-safe via HAMT.

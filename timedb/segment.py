@@ -30,7 +30,6 @@ def _serialize_event(event: Event) -> dict:
         "value": _serialize_value(event.value),
         "timestamp": event.timestamp.isoformat(),
         "tx_id": event.tx_id,
-        "prev_seq": event.prev_seq,
     }
 
 
@@ -41,7 +40,6 @@ def _deserialize_event(raw: dict) -> Event:
         value=_deserialize_value(raw["value"]),
         timestamp=datetime.fromisoformat(raw["timestamp"]),
         tx_id=raw["tx_id"],
-        prev_seq=raw["prev_seq"],
     )
 
 
@@ -92,7 +90,7 @@ def write_manifest(path: str | Path, manifest: dict):
     os.replace(tmp, path)
 
 
-def segment_filenname(num: int) -> str:
+def segment_filename(num: int) -> str:
     return f"{num:06d}.log"
 
 

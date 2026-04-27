@@ -1,81 +1,41 @@
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterator, Optional, Sequence
-from threading import Lock
 
 from .types import Event, ABSENT, validate_value
-from .log import Log
+from .log import LogProtocol, Log
+from .durable_log import DurableLog
 from .snapshot import Snapshot
-from . import segment
-
-
-DEFAULT_SEGMENT_BYTES = 64 * 1024 * 1024
-_MANIFEST_NAME = "manifest"
 
 
 class TimeDB:
-    def __init__(
-        self, path: str | Path, *, segment_bytes: int = DEFAULT_SEGMENT_BYTES
-    ):
-        directory = Path(path)
-        if not directory.is_dir():
-            raise ValueError(f"not a directory: {directory}")
-        manifest = segment.read_manifest(directory / _MANIFEST_NAME)
+    def __init__(self, log: LogProtocol):
+        self._log = log
 
-        events: list[Event] = []
-        for seg in manifest["segments"]:
-            seg_events = segment.read_events(directory / seg["filename"])
-            if len(seg_events) != seg["event_count"]:
-                raise ValueError(
-                    f"segment {seg['filename']}: manifest says "
-                    f"{seg['event_count']} events, file has {len(seg_events)}"
-                )
-            events.extend(seg_events)
+    @classmethod
+    def in_memory(cls) -> "TimeDB":
+        return cls(Log([]))
 
-        self._log = Log(events)
-        self._save_lock = Lock()
-        self._segments = manifest["segments"]
-        self._segment_bytes = segment_bytes
+    @classmethod
+    def open(
+        cls, 
+        path: str | Path, 
+        save_bytes: int, 
+        save_seconds: float, 
+        segment_bytes: int,
+    ) -> "TimeDB":
+        return cls(DurableLog.open(
+            Path(path), save_bytes, save_seconds, segment_bytes
+        ))
 
-    def save(self, path: str | Path):
-        with self._save_lock:
-            directory = Path(path)
-            directory.mkdir(parents=True, exist_ok=True)
+    def flush(self):
+        self._log.flush()
+        
+    def __enter__(self) -> "TimeDB":
+        return self
 
-            sealed = [s for s in self._segments if s["sealed"]]
-
-            if sealed:
-                first_unsealed_seq = sealed[-1]["last_seq"]
-            else:
-                first_unsealed_seq = 0
-
-            if not self._segments:
-                next_num = -1
-            elif self._segments[-1]["sealed"]:
-                next_num = _segment_num(self._segments[-1]["filename"]) + 1
-            else:
-                next_num = _segment_num(self._segments[-1]["filename"])
-
-            to_write = self.events()[first_unsealed_seq:]
-            chunks = segment.bin_events_by_size(to_write, self._segment_bytes)
-
-            new_segments = []
-            for i, chunk in enumerate(chunks):
-                filename = f"{next_num + i:06d}.log"
-                segment.atomic_write_events(directory / filename, chunk)
-                new_segments.append({
-                    "filename": filename,
-                    "first_seq": chunk[0].seq,
-                    "last_seq": chunk[-1].seq,
-                    "event_count": len(chunk),
-                    "sealed": i < len(chunks) - 1,
-                })
-
-            all_segments = sealed + new_segments
-            segment.write_manifest(
-                directory / _MANIFEST_NAME, {"segments": all_segments}
-            )
-            self._segments = all_segments
+    def __exit__(self, *exc) -> bool:
+        return self._log.__exit__(*exc)
 
     def put(self, key: str, value: Any) -> int:
         return self.put_at(key, value, datetime.now())
@@ -135,7 +95,3 @@ class TimeDB:
     def __repr__(self) -> str:
         n = len(self._log.events())
         return f"TimeDB({n} {'events' if n != 1 else 'event'})"
-
-
-def _segment_num(filename: str) -> int:
-    return int(filename.split(".")[0])

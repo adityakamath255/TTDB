@@ -1,4 +1,4 @@
-from typing import Any, Optional, Iterator, Sequence
+from typing import Any, Optional, Iterator, Sequence, Protocol
 from threading import Lock
 from datetime import datetime
 
@@ -10,7 +10,48 @@ from .types import Event, ABSENT
 _EMPTY = immutables.Map()
 
 
-class Log:
+class LogProtocol(Protocol):
+    def write(self, key: str, value: Any, at: datetime) -> int: 
+        ...
+
+    def write_tx(self, writes: dict[str, Any], at: datetime) -> tuple[int, int]:
+        ...
+
+    def root_at(self, seq: int) -> immutables.Map:
+        ...
+
+    def get(self, seq: int) -> Optional[Event]:
+        ...
+
+    def events(self) -> Sequence[Event]:
+        ...
+
+    def events_between(self, lo: int, hi: int) -> Iterator[Event]:
+        ...
+
+    def latest(self) -> int:
+        ...
+
+    def tx_exists(self, tx_id: int) -> bool:
+        ...
+
+    def tx_events(self, tx_id: int) -> Iterator[Event]:
+        ...
+
+    def history(self, key: str, lo: int, hi: int) -> Iterator[Event]:
+        ...
+
+    def flush(self):
+        ...
+
+    def __enter__(self) -> "LogProtocol":
+        ...
+
+    def __exit__(self, *exc) -> bool:
+        ...
+
+
+class Log(LogProtocol):
     def __init__(self, events: list[Event]):
         self._events: list[Event] = []
         self._roots: list[immutables.Map] = []
@@ -104,3 +145,12 @@ class Log:
             chain.append(self._events[seq])
             seq = self._events[seq].prev_seq
         return reversed(chain)
+
+    def flush(self):
+        pass
+
+    def __enter__(self) -> "Log":
+        return self
+
+    def __exit__(self, *exc) -> bool:
+        return False

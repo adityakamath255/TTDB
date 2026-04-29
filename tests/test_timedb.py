@@ -86,17 +86,17 @@ def test_accepts_out_of_order_timestamps(ts):
 
 def test_snapshot_at_each_seq():
     db = make_db(("x", 1, T0), ("x", 2, T1), ("x", 3, T2))
-    assert db.at(0).get("x") == 1
-    assert db.at(1).get("x") == 2
-    assert db.at(2).get("x") == 3
+    assert db.at(1).get("x") == 1
+    assert db.at(2).get("x") == 2
+    assert db.at(3).get("x") == 3
 
 def test_snapshot_at_latest_seq_allowed():
     db = make_db(("x", 1, T0), ("y", 2, T1))
-    assert db.at(1).get("y") == 2
+    assert db.at(2).get("y") == 2
 
 def test_snapshot_isolation_from_later_writes():
     db = make_db(("x", 1, T0))
-    snap = db.at(0)
+    snap = db.at(1)
     db.put_at("x", 2, T1)
     assert snap.get("x") == 1
 
@@ -104,6 +104,11 @@ def test_snapshot_out_of_range_raises():
     db = make_db(("x", 1, T0))
     with pytest.raises(ValueError):
         db.at(5)
+
+def test_snapshot_negative_raises():
+    db = make_db(("x", 1, T0))
+    with pytest.raises(ValueError):
+        db.at(-1)
 
 def test_empty_db_latest_is_empty_snapshot():
     db = TimeDB.in_memory()
@@ -113,9 +118,9 @@ def test_empty_db_latest_is_empty_snapshot():
     assert list(snap.items()) == []
     assert snap.timestamp() is None
 
-def test_snapshot_at_minus_one_is_before_all():
+def test_snapshot_at_zero_is_empty():
     db = make_db(("x", 1, T0))
-    snap = db.at(-1)
+    snap = db.at(0)
     assert snap.get("x") is ABSENT
     assert list(snap.keys()) == []
     assert snap.timestamp() is None
@@ -124,8 +129,8 @@ def test_snapshot_seq():
     db = make_db(("x", 1, T0), ("y", 2, T1))
     assert db.at(0).seq() == 0
     assert db.at(1).seq() == 1
-    assert db.latest().seq() == 1
-    assert db.at(-1).seq() == -1
+    assert db.at(2).seq() == 2
+    assert db.latest().seq() == 2
 
 
 # -- snapshot views --
@@ -142,8 +147,8 @@ def test_keys_excludes_deleted():
 
 def test_items_at_seq():
     db = make_db(("x", 1, T0), ("y", 2, T1), ("x", 3, T2))
-    assert dict(db.at(1).items()) == {"x": 1, "y": 2}
-    assert dict(db.at(2).items()) == {"x": 3, "y": 2}
+    assert dict(db.at(2).items()) == {"x": 1, "y": 2}
+    assert dict(db.at(3).items()) == {"x": 3, "y": 2}
 
 def test_keys_after_overwrite_unique():
     db = make_db(("x", 1, T0), ("x", 2, T1), ("x", 3, T2))
@@ -151,8 +156,8 @@ def test_keys_after_overwrite_unique():
 
 def test_timestamp_at_seq():
     db = make_db(("x", 1, T0), ("y", 2, T1))
-    assert db.at(0).timestamp() == T0
-    assert db.at(1).timestamp() == T1
+    assert db.at(1).timestamp() == T0
+    assert db.at(2).timestamp() == T1
 
 
 # -- events --
@@ -176,23 +181,24 @@ def test_between_half_open():
         ("a", 0, T0), ("b", 1, T1), ("c", 2, T2),
         ("d", 3, T3), ("e", 4, T4),
     )
-    assert [e.seq for e in db.between(1, 3)] == [2, 3]
+    assert [e.seq for e in db.between(1, 3)] == [1, 2]
 
 def test_between_empty_range():
     db = make_db(("a", 0, T0), ("b", 1, T1))
     assert list(db.between(0, 0)) == []
 
-def test_between_from_before_all():
+def test_between_from_zero():
     db = make_db(("a", 0, T0), ("b", 1, T1), ("c", 2, T2))
-    assert [e.seq for e in db.between(-1, 1)] == [0, 1]
+    assert [e.seq for e in db.between(0, 2)] == [0, 1]
 
 def test_between_full_log():
     db = make_db(("a", 0, T0), ("b", 1, T1), ("c", 2, T2))
-    assert [e.seq for e in db.between(-1, 2)] == [0, 1, 2]
+    assert [e.seq for e in db.between(0, 3)] == [0, 1, 2]
 
 @pytest.mark.parametrize("seq0,seq1", [
     (1, 0),
     (0, 5),
+    (-1, 1),
 ])
 def test_between_invalid_range_raises(seq0, seq1):
     db = make_db(("a", 0, T0), ("b", 1, T1))
@@ -204,33 +210,33 @@ def test_between_invalid_range_raises(seq0, seq1):
 
 def test_between_returns_interval():
     db = make_db(("x", 1, T0))
-    assert isinstance(db.between(-1, 0), Interval)
+    assert isinstance(db.between(0, 1), Interval)
 
 def test_interval_iterates_events():
     db = make_db(("a", 0, T0), ("b", 1, T1), ("c", 2, T2))
-    assert [e.seq for e in db.between(0, 2)] == [1, 2]
+    assert [e.seq for e in db.between(0, 2)] == [0, 1]
 
 def test_interval_history_filters_by_key():
     db = make_db(
         ("x", 1, T0), ("y", 2, T1), ("x", 3, T2), ("z", 4, T3), ("x", 5, T4),
     )
-    assert [e.value for e in db.between(-1, 4).history("x")] == [1, 3, 5]
+    assert [e.value for e in db.between(0, 5).history("x")] == [1, 3, 5]
 
 def test_interval_history_within_bounds():
     db = make_db(("x", 1, T0), ("x", 2, T1), ("x", 3, T2), ("x", 4, T3))
-    assert [e.value for e in db.between(0, 2).history("x")] == [2, 3]
+    assert [e.value for e in db.between(0, 2).history("x")] == [1, 2]
 
 def test_interval_history_missing_key_empty():
     db = make_db(("x", 1, T0))
-    assert list(db.between(-1, 0).history("missing")) == []
+    assert list(db.between(0, 1).history("missing")) == []
 
 def test_interval_keys_touched():
     db = make_db(("x", 1, T0), ("y", 2, T1), ("x", 3, T2), ("z", 4, T3))
-    assert db.between(-1, 3).keys_touched() == {"x", "y", "z"}
+    assert db.between(0, 4).keys_touched() == {"x", "y", "z"}
 
 def test_interval_keys_touched_within_bounds():
     db = make_db(("x", 1, T0), ("y", 2, T1), ("z", 3, T2))
-    assert db.between(0, 2).keys_touched() == {"y", "z"}
+    assert db.between(0, 2).keys_touched() == {"x", "y"}
 
 def test_interval_keys_touched_empty_range():
     db = make_db(("x", 1, T0))
@@ -241,32 +247,32 @@ def test_interval_tx_ids_excludes_singletons():
     db.put_at("a", 1, T0)
     tx, _ = db.apply_at({"x": 1, "y": 2}, T1)
     db.put_at("b", 3, T2)
-    assert db.between(-1, 3).tx_ids() == {tx}
+    assert db.between(0, 4).tx_ids() == {tx}
 
 def test_interval_tx_ids_multiple():
     db = TimeDB.in_memory()
     tx1, _ = db.apply_at({"a": 1, "b": 2}, T0)
     tx2, _ = db.apply_at({"c": 3, "d": 4}, T1)
-    assert db.between(-1, 3).tx_ids() == {tx1, tx2}
+    assert db.between(0, 4).tx_ids() == {tx1, tx2}
 
 def test_interval_tx_ids_empty_when_only_singletons():
     db = make_db(("x", 1, T0), ("y", 2, T1))
-    assert db.between(-1, 1).tx_ids() == set()
+    assert db.between(0, 2).tx_ids() == set()
 
 def test_interval_count():
     db = make_db(("a", 0, T0), ("b", 1, T1), ("c", 2, T2), ("d", 3, T3))
-    assert db.between(-1, 3).count() == 4
-    assert db.between(0, 3).count() == 3
-    assert db.between(1, 3).count() == 2
+    assert db.between(0, 4).count() == 4
+    assert db.between(1, 4).count() == 3
+    assert db.between(2, 4).count() == 2
     assert db.between(2, 2).count() == 0
 
 def test_interval_count_empty_log():
     db = TimeDB.in_memory()
-    assert db.between(-1, -1).count() == 0
+    assert db.between(0, 0).count() == 0
 
 def test_interval_count_matches_iter():
     db = make_db(("a", 0, T0), ("b", 1, T1), ("c", 2, T2))
-    iv = db.between(-1, 2)
+    iv = db.between(0, 3)
     assert iv.count() == len(list(iv))
 
 
@@ -301,41 +307,41 @@ def test_diff_same_snapshot_is_empty():
 
 def test_diff_value_changed_and_restored():
     db = make_db(("x", 1, T0), ("x", 2, T1), ("x", 1, T2))
-    assert diff_dict(db.at(0), db.at(2)) == {}
+    assert diff_dict(db.at(1), db.at(3)) == {}
 
 def test_diff_directional():
     db = make_db(("x", 1, T0), ("x", 2, T1))
-    assert diff_dict(db.at(0), db.at(1)) == {"x": (1, 2)}
-    assert diff_dict(db.at(1), db.at(0)) == {"x": (2, 1)}
+    assert diff_dict(db.at(1), db.at(2)) == {"x": (1, 2)}
+    assert diff_dict(db.at(2), db.at(1)) == {"x": (2, 1)}
 
 @pytest.mark.parametrize("setup,a,b,expected", [
     (lambda db: (db.put_at("x", 1, T0), db.put_at("y", 2, T1)),
-     0, 1, {"y": (ABSENT, 2)}),
+     1, 2, {"y": (ABSENT, 2)}),
     (lambda db: (db.put_at("x", 1, T0), db.delete_at("x", T1)),
-     0, 1, {"x": (1, ABSENT)}),
+     1, 2, {"x": (1, ABSENT)}),
     (lambda db: (db.put_at("x", 1, T0), db.put_at("x", 2, T1)),
-     0, 1, {"x": (1, 2)}),
+     1, 2, {"x": (1, 2)}),
     (lambda db: (
         db.put_at("x", 1, T0), db.put_at("y", 2, T1), db.put_at("x", 3, T2)
      ),
-     0, 2, {"x": (1, 3), "y": (ABSENT, 2)}),
+     1, 3, {"x": (1, 3), "y": (ABSENT, 2)}),
     (lambda db: (
         db.put_at("x", 1, T0), db.delete_at("x", T1), db.put_at("x", 1, T2)
      ),
-     0, 2, {}),
+     1, 3, {}),
     (lambda db: (
         db.put_at("x", 1, T0), db.delete_at("x", T1), db.put_at("x", 2, T2)
      ),
-     0, 2, {"x": (1, 2)}),
+     1, 3, {"x": (1, 2)}),
 ])
 def test_diff_cases(setup, a, b, expected):
     db = TimeDB.in_memory()
     setup(db)
     assert diff_dict(db.at(a), db.at(b)) == expected
 
-def test_diff_from_before_all():
+def test_diff_from_zero():
     db = make_db(("x", 1, T0), ("y", 2, T1))
-    assert diff_dict(db.at(-1), db.latest()) == {
+    assert diff_dict(db.at(0), db.latest()) == {
         "x": (ABSENT, 1), "y": (ABSENT, 2),
     }
 
@@ -349,9 +355,9 @@ def test_apply_basic():
     assert snap.get("x") == 1
     assert snap.get("y") == 2
 
-def test_apply_returns_first_and_last_seq():
+def test_apply_returns_start_and_end():
     db = make_db(("a", 0, T0), ("b", 1, T1))
-    assert db.apply_at({"x": 1, "y": 2}, T2) == (2, 3)
+    assert db.apply_at({"x": 1, "y": 2}, T2) == (2, 4)
 
 def test_apply_empty_dict_raises():
     db = TimeDB.in_memory()
@@ -392,12 +398,12 @@ def test_apply_uses_now_for_timestamp():
 
 def test_transaction_events_contiguous():
     db = TimeDB.in_memory()
-    tx1, last1 = db.apply_at({"a": 1, "b": 2}, T0)
+    tx1, end1 = db.apply_at({"a": 1, "b": 2}, T0)
     db.put_at("singleton", 99, T1)
-    tx2, last2 = db.apply_at({"c": 3, "d": 4, "e": 5}, T2)
+    tx2, end2 = db.apply_at({"c": 3, "d": 4, "e": 5}, T2)
 
-    assert (tx1, last1) == (0, 1)
-    assert (tx2, last2) == (3, 5)
+    assert (tx1, end1) == (0, 2)
+    assert (tx2, end2) == (3, 6)
     assert [e.key for e in db.tx_events(tx1)] == ["a", "b"]
     assert [e.key for e in db.tx_events(tx2)] == ["c", "d", "e"]
 
@@ -474,7 +480,7 @@ def test_roundtrip(tmp_path):
 
     with TimeDB.open(path, SAVE_EVENTS, SAVE_SECONDS, SEG) as loaded:
         assert dict(loaded.latest().items()) == {"y": "hello"}
-        assert loaded.at(0).get("x") == 1
+        assert loaded.at(1).get("x") == 1
         assert loaded.latest().get("x") is ABSENT
         assert loaded.latest().get("y") == "hello"
 

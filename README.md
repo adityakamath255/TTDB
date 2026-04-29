@@ -52,11 +52,11 @@ A background thread writes events to segment files in `path/`. Writes are durabl
 ### Time travel
 
 ```python
-snap0 = db.at(0)
-print(snap0.get("user.name"))  # "alice"
+snap1 = db.at(1)
+print(snap1.get("user.name"))  # "alice"
 ```
 
-`db.at(-1)` is a snapshot before any events; everything resolves to `ABSENT`. `db.latest()` is shorthand for the snapshot at the last written event (or seq -1 if empty).
+A Snapshot's seq is a *position* in the log: `at(0)` is the empty state before any events; `at(k)` is the state after the first `k` events have been applied; `at(n)` is the latest. `db.latest()` is shorthand for the snapshot at the current event count.
 
 ### Deletion
 
@@ -68,13 +68,13 @@ print(db.latest().get("user.name"))  # ABSENT
 ### Atomic writes
 
 ```python
-first_seq, last_seq = db.apply({
+start, end = db.apply({
     "order.id": 42,
     "order.status": "pending",
 })
 ```
 
-All keys in a single `apply` call share the same transaction ID and timestamp. `apply` raises `ValueError` on an empty dict.
+All keys in a single `apply` call share the same transaction ID and timestamp. The return value is the half-open seq range `[start, end)` covering the events written, so `db.between(start, end)` gives you back this transaction. `apply` raises `ValueError` on an empty dict.
 
 ### Diffing snapshots
 
@@ -98,7 +98,7 @@ for event in db.between(seq0, seq1):
     print(event.seq, event.key, event.value)
 ```
 
-`between(seq0, seq1)` returns an `Interval`: a view over events in `(seq0, seq1]` (half-open at the low end so it pairs naturally with `db.at(seq0)` / `db.at(seq1)`). Iterating an Interval yields its events. It also exposes:
+`between(seq0, seq1)` returns an `Interval`: a view over events in `[seq0, seq1)` (Python slice semantics). It pairs naturally with snapshots: `db.at(seq0)` is the state before the interval's events and `db.at(seq1)` is the state after. Iterating an Interval yields its events. It also exposes:
 
 - `iv.history(key)` — events whose key matches, in seq order
 - `iv.keys_touched()` — set of distinct keys with at least one event in the interval
@@ -112,7 +112,7 @@ for event in db.history("user.name"):
     print(event.seq, event.value, event.timestamp)
 ```
 
-`db.history(key)` is shorthand for the full-log case: `db.between(-1, latest).history(key)`.
+`db.history(key)` is shorthand for the full-log case: `db.between(0, n).history(key)`.
 
 ### Transactions
 

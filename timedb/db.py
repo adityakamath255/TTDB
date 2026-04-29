@@ -58,27 +58,30 @@ class TimeDB:
         return self.put_at(key, ABSENT, at)
 
     def at(self, seq: int) -> Snapshot:
-        if seq > self._log.latest():
-            raise ValueError(f"no event at seq {seq}")
+        n = self._log.count()
+        if not (0 <= seq <= n):
+            raise ValueError(
+                f"invalid seq {seq}: log has {n} events"
+            )
         return Snapshot(self._log, seq)
 
     def latest(self) -> Snapshot:
-        return Snapshot(self._log, self._log.latest())
+        return Snapshot(self._log, self._log.count())
 
     def events(self) -> Sequence[Event]:
         return self._log.events()
 
     def between(self, seq0: int, seq1: int) -> Interval:
-        n = self._log.latest()
-        if not (seq0 <= seq1 <= n):
+        n = self._log.count()
+        if not (0 <= seq0 <= seq1 <= n):
             raise ValueError(
                 f"invalid range: seq0={seq0}, seq1={seq1}, "
-                f"log has {n + 1} events"
+                f"log has {n} events"
             )
         return Interval(self._log, seq0, seq1)
 
     def history(self, key: str) -> Iterator[Event]:
-        return self.between(-1, self._log.latest()).history(key)
+        return self.between(0, self._log.count()).history(key)
 
     def apply(self, writes: dict[str, Any]) -> tuple[int, int]:
         return self.apply_at(writes, datetime.now())

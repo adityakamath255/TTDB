@@ -18,10 +18,10 @@ class Snapshot:
         return self._root.get(key, ABSENT)
 
     def timestamp(self) -> Optional[datetime]:
-        if event := self._log.get(self._seq):
-            return event.timestamp
-        else:
+        if self._seq == 0:
             return None
+        else:
+            return self._log.event_at(self._seq - 1).timestamp
 
     def keys(self) -> Iterator[str]:
         return iter(self._root)

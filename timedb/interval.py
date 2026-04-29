@@ -34,7 +34,7 @@ class Interval:
         }
 
     def count(self) -> int:
-        return self._hi - max(-1, self._lo)
+        return self._hi - self._lo
 
     def __repr__(self) -> str:
-        return f"Interval(seq=({self._lo}, {self._hi}])"
+        return f"Interval(seq=[{self._lo}, {self._hi}))"

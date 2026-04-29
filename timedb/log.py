@@ -15,7 +15,7 @@ class Log:
     def __init__(self, listener: AbstractContextManager):
         self._listener = listener
         self._events: list[Event] = []
-        self._roots: list[immutables.Map] = []
+        self._roots: list[immutables.Map] = [_EMPTY]
         self._lock = Lock()
 
     @classmethod
@@ -30,7 +30,7 @@ class Log:
             self._index(e)
 
     def _index(self, event: Event):
-        prev_root = self._roots[-1] if self._roots else _EMPTY
+        prev_root = self._roots[-1]
         if event.value is not ABSENT:
             new_root = prev_root.set(event.key, event.value)
         elif event.key in prev_root:
@@ -62,26 +62,25 @@ class Log:
     ) -> tuple[int, int]:
         with self._listener, self._lock:
             tx_id = len(self._events)
-            last_seq = tx_id
             for key, value in writes.items():
-                last_seq = self._publish(key, value, at, tx_id)
-            return (tx_id, last_seq)
+                self._publish(key, value, at, tx_id)
+            return (tx_id, len(self._events))
 
     def root_at(self, seq: int) -> immutables.Map:
-        return _EMPTY if seq < 0 else self._roots[seq]
+        return self._roots[seq]
 
-    def get(self, seq: int) -> Optional[Event]:
-        return None if seq < 0 else self._events[seq]
+    def event_at(self, seq: int) -> Event:
+        return self._events[seq]
 
     def events(self) -> Sequence[Event]:
         return self._events
 
     def events_between(self, lo: int, hi: int) -> Iterator[Event]:
-        return (self._events[i] for i in range(max(0, lo + 1), hi + 1))
+        return (self._events[i] for i in range(lo, hi))
 
-    def latest(self) -> int:
+    def count(self) -> int:
         with self._lock:
-            return len(self._events) - 1
+            return len(self._events)
 
     def tx_exists(self, tx_id: int) -> bool:
         return (

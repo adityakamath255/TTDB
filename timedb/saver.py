@@ -38,7 +38,7 @@ class Saver:
         self._segment_bytes = segment_bytes
 
         # mutable
-        self._persisted_through_seq = active.last_seq if active else -1
+        self._persisted_count = active.last_seq + 1 if active else 0
         self._wake = Condition()
         self._closing = False
         self._save_error: Optional[Exception] = None
@@ -92,18 +92,18 @@ class Saver:
     def __exit__(self, exc_type, exc_val, exc_tb):
         if exc_type is not None:
             return
-        seq = self._log.latest()
-        if seq - self._persisted_through_seq >= self._save_events:
+        n = self._log.count()
+        if n - self._persisted_count >= self._save_events:
             with self._wake:
                 self._wake.notify()
 
     def flush(self):
         if self._save_error is not None:
             raise self._save_error
-        target = self._log.latest()
+        target = self._log.count()
         with self._wake:
             self._wake.notify()
-            while self._persisted_through_seq < target:
+            while self._persisted_count < target:
                 if self._save_error is not None:
                     raise self._save_error
                 self._wake.wait()
@@ -127,10 +127,10 @@ class Saver:
                     return
                 if not self._has_unsaved():
                     continue
-                target_seq = self._log.latest()
+                target_count = self._log.count()
 
             try:
-                self._do_save(target_seq)
+                self._do_save(target_count)
             except Exception as e:
                 with self._wake:
                     self._save_error = e
@@ -138,13 +138,13 @@ class Saver:
                 return
 
             with self._wake:
-                self._persisted_through_seq = target_seq
+                self._persisted_count = target_count
                 self._wake.notify_all()
 
     def _has_unsaved(self) -> bool:
-        return self._log.latest() > self._persisted_through_seq
+        return self._log.count() > self._persisted_count
 
-    def _do_save(self, target_seq: int):
+    def _do_save(self, target_count: int):
         if self._sealed:
             active_first_seq = self._sealed[-1].last_seq + 1
             next_num = segment.segment_num(self._sealed[-1].filename) + 1
@@ -152,7 +152,7 @@ class Saver:
             active_first_seq = 0
             next_num = 1
 
-        to_write = self._log.events()[active_first_seq: target_seq + 1]
+        to_write = self._log.events()[active_first_seq:target_count]
         chunks = segment.bin_events_by_size(to_write, self._segment_bytes)
 
         new_segments: list[SegmentMeta] = []

@@ -1,6 +1,6 @@
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Iterator, Optional, Sequence
+from typing import Any, Iterator, Optional
 
 from .types import Event, ABSENT, validate_value
 from .log import Log
@@ -68,7 +68,7 @@ class TimeDB:
     def latest(self) -> Snapshot:
         return Snapshot(self._log, self._log.count())
 
-    def events(self) -> Sequence[Event]:
+    def events(self) -> Iterator[Event]:
         return self._log.events()
 
     def between(self, seq0: int, seq1: int) -> Interval:
@@ -101,5 +101,5 @@ class TimeDB:
         return self._log.tx_events(tx_id)
 
     def __repr__(self) -> str:
-        n = len(self._log.events())
+        n = self._log.count()
         return f"TimeDB({n} {'events' if n != 1 else 'event'})"

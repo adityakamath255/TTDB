@@ -4,6 +4,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterable
 
+import immutables
+
 from .types import Event, ABSENT
 
 
@@ -94,5 +96,27 @@ def segment_filename(num: int) -> str:
     return f"{num:06d}.log"
 
 
+def state_filename(num: int) -> str:
+    return f"{num:06d}.state"
+
+
 def segment_num(filename: str) -> int:
     return int(filename.split(".")[0])
+
+
+def read_state(path: str | Path) -> immutables.Map:
+    items: dict = {}
+    with open(path) as f:
+        for line in f:
+            entry = json.loads(line)
+            items[entry["k"]] = entry["v"]
+    return immutables.Map(items)
+
+
+def atomic_write_state(path: str | Path, root: immutables.Map):
+    path = Path(path)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with open(tmp, "w") as f:
+        for k, v in root.items():
+            f.write(json.dumps({"k": k, "v": v}) + "\n")
+    os.replace(tmp, path)

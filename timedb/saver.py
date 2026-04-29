@@ -1,10 +1,12 @@
 from dataclasses import dataclass, asdict
 from pathlib import Path
-from threading import Thread, Condition
-from typing import Optional
+from threading import Thread, Condition, Lock
+from typing import Optional, Iterator
 
-from .log import Log
-from .types import Event
+import immutables
+
+from .log import Log, _EMPTY
+from .types import Event, ABSENT
 from . import segment
 
 
@@ -15,6 +17,14 @@ _MANIFEST_NAME = "manifest"
 class SegmentMeta:
     filename: str
     last_seq: int
+
+
+def _state_filename(seg: SegmentMeta) -> str:
+    return segment.state_filename(segment.segment_num(seg.filename))
+
+
+def _first_seq(sealed: list[SegmentMeta], idx: int) -> int:
+    return 0 if idx == 0 else sealed[idx - 1].last_seq + 1
 
 
 class Saver:
@@ -28,7 +38,6 @@ class Saver:
         save_seconds: float,
         segment_bytes: int,
     ):
-        # immutable
         self._log = log
         self._directory = directory
         self._sealed = sealed
@@ -37,7 +46,7 @@ class Saver:
         self._save_seconds = save_seconds
         self._segment_bytes = segment_bytes
 
-        # mutable
+        self._meta_lock = Lock()
         self._persisted_count = active.last_seq + 1 if active else 0
         self._wake = Condition()
         self._closing = False
@@ -67,11 +76,24 @@ class Saver:
         else:
             sealed, active = [], None
 
-        events: list[Event] = []
-        for seg in metas:
-            events.extend(segment.read_events(directory / seg.filename))
+        if active:
+            active_events = segment.read_events(directory / active.filename)
+            latest_root = segment.read_state(directory / _state_filename(active))
+            if sealed:
+                active_base_root = segment.read_state(
+                    directory / _state_filename(sealed[-1])
+                )
+                active_first_seq = sealed[-1].last_seq + 1
+            else:
+                active_base_root = _EMPTY
+                active_first_seq = 0
+        else:
+            active_events = []
+            latest_root = _EMPTY
+            active_base_root = _EMPTY
+            active_first_seq = 0
 
-        log.replay(events)
+        log.bootstrap(active_events, latest_root, active_base_root, active_first_seq)
 
         saver = cls(
             log, directory, sealed, active,
@@ -127,10 +149,9 @@ class Saver:
                     return
                 if not self._has_unsaved():
                     continue
-                target_count = self._log.count()
 
             try:
-                self._do_save(target_count)
+                new_persisted = self._do_save()
             except Exception as e:
                 with self._wake:
                     self._save_error = e
@@ -138,37 +159,122 @@ class Saver:
                 return
 
             with self._wake:
-                self._persisted_count = target_count
+                self._persisted_count = new_persisted
                 self._wake.notify_all()
 
     def _has_unsaved(self) -> bool:
         return self._log.count() > self._persisted_count
 
-    def _do_save(self, target_count: int):
-        if self._sealed:
-            active_first_seq = self._sealed[-1].last_seq + 1
-            next_num = segment.segment_num(self._sealed[-1].filename) + 1
-        else:
-            active_first_seq = 0
-            next_num = 1
+    def _do_save(self) -> int:
+        active_events = self._log.active_events()
+        if not active_events:
+            return self._persisted_count
 
-        to_write = self._log.events()[active_first_seq:target_count]
-        chunks = segment.bin_events_by_size(to_write, self._segment_bytes)
+        if self._sealed:
+            base_root = segment.read_state(
+                self._directory / _state_filename(self._sealed[-1])
+            )
+        else:
+            base_root = _EMPTY
+
+        if self._active:
+            active_num = segment.segment_num(self._active.filename)
+        elif self._sealed:
+            active_num = segment.segment_num(self._sealed[-1].filename) + 1
+        else:
+            active_num = 1
+
+        chunks = segment.bin_events_by_size(active_events, self._segment_bytes)
 
         new_segments: list[SegmentMeta] = []
+        chunk_end_states: list[immutables.Map] = []
+        state = base_root
         for i, chunk in enumerate(chunks):
-            filename = segment.segment_filename(next_num + i)
-            segment.atomic_write_events(self._directory / filename, chunk)
+            for e in chunk:
+                if e.value is not ABSENT:
+                    state = state.set(e.key, e.value)
+                elif e.key in state:
+                    state = state.delete(e.key)
+            chunk_end_states.append(state)
+            chunk_num = active_num + i
+            log_filename = segment.segment_filename(chunk_num)
+            segment.atomic_write_events(self._directory / log_filename, chunk)
+            segment.atomic_write_state(
+                self._directory / segment.state_filename(chunk_num), state
+            )
             new_segments.append(SegmentMeta(
-                filename=filename,
+                filename=log_filename,
                 last_seq=chunk[-1].seq,
             ))
 
-        self._sealed = self._sealed + new_segments[:-1]
-        self._active = new_segments[-1]
-        all_metas = self._sealed + [self._active]
+        new_sealed = self._sealed + new_segments[:-1]
+        new_active = new_segments[-1]
+        all_metas = new_sealed + [new_active]
 
         segment.write_manifest(
             self._directory / _MANIFEST_NAME,
             {"segments": [asdict(s) for s in all_metas]},
         )
+
+        with self._meta_lock:
+            self._sealed = new_sealed
+            self._active = new_active
+
+        if len(chunks) > 1:
+            new_active_first_seq = chunks[-1][0].seq
+            new_active_base = chunk_end_states[-2]
+            self._log.truncate_active(new_active_first_seq, new_active_base)
+
+        return new_active.last_seq + 1
+
+    def event_at(self, seq: int) -> Event:
+        with self._meta_lock:
+            sealed = self._sealed
+        for idx, seg in enumerate(sealed):
+            first = _first_seq(sealed, idx)
+            if first <= seq <= seg.last_seq:
+                events = segment.read_events(self._directory / seg.filename)
+                return events[seq - first]
+        raise IndexError(f"seq {seq} not in sealed range")
+
+    def events_between(self, lo: int, hi: int) -> Iterator[Event]:
+        with self._meta_lock:
+            sealed = self._sealed
+        for idx, seg in enumerate(sealed):
+            first = _first_seq(sealed, idx)
+            last = seg.last_seq
+            if hi <= first:
+                return
+            if lo > last:
+                continue
+            events = segment.read_events(self._directory / seg.filename)
+            for e in events:
+                if lo <= e.seq < hi:
+                    yield e
+
+    def state_at(self, p: int) -> immutables.Map:
+        with self._meta_lock:
+            sealed = self._sealed
+        for idx, seg in enumerate(sealed):
+            end_pos = seg.last_seq + 1
+            if p == end_pos:
+                return segment.read_state(self._directory / _state_filename(seg))
+            if p < end_pos:
+                base = (
+                    segment.read_state(
+                        self._directory / _state_filename(sealed[idx - 1])
+                    )
+                    if idx > 0
+                    else _EMPTY
+                )
+                events = segment.read_events(self._directory / seg.filename)
+                root = base
+                for e in events:
+                    if e.seq >= p:
+                        break
+                    if e.value is not ABSENT:
+                        root = root.set(e.key, e.value)
+                    elif e.key in root:
+                        root = root.delete(e.key)
+                return root
+        raise IndexError(f"position {p} not in sealed range")

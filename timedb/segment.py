@@ -50,13 +50,28 @@ def read_events(path: str | Path) -> list[Event]:
         return [_deserialize_event(json.loads(line)) for line in f]
 
 
-def atomic_write_events(path: str | Path, events: Iterable[Event]):
+def _fsync_dir(path: Path):
+    fd = os.open(str(path), os.O_DIRECTORY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def atomic_write_events(
+    path: str | Path, events: Iterable[Event], fsync: bool
+):
     path = Path(path)
     tmp = path.with_suffix(path.suffix + ".tmp")
     with open(tmp, "w") as f:
         for event in events:
             f.write(json.dumps(_serialize_event(event)) + "\n")
+        if fsync:
+            f.flush()
+            os.fsync(f.fileno())
     os.replace(tmp, path)
+    if fsync:
+        _fsync_dir(path.parent)
 
 
 def bin_events_by_size(
@@ -83,13 +98,18 @@ def read_manifest(path: str | Path) -> dict:
         return json.load(f)
 
 
-def write_manifest(path: str | Path, manifest: dict):
+def write_manifest(path: str | Path, manifest: dict, fsync: bool):
     path = Path(path)
     tmp = path.with_suffix(".tmp")
     with open(tmp, "w") as f:
         json.dump(manifest, f)
         f.write("\n")
+        if fsync:
+            f.flush()
+            os.fsync(f.fileno())
     os.replace(tmp, path)
+    if fsync:
+        _fsync_dir(path.parent)
 
 
 def segment_filename(num: int) -> str:
@@ -113,10 +133,15 @@ def read_state(path: str | Path) -> immutables.Map:
     return immutables.Map(items)
 
 
-def atomic_write_state(path: str | Path, root: immutables.Map):
+def atomic_write_state(path: str | Path, root: immutables.Map, fsync: bool):
     path = Path(path)
     tmp = path.with_suffix(path.suffix + ".tmp")
     with open(tmp, "w") as f:
         for k, v in root.items():
             f.write(json.dumps({"k": k, "v": v}) + "\n")
+        if fsync:
+            f.flush()
+            os.fsync(f.fileno())
     os.replace(tmp, path)
+    if fsync:
+        _fsync_dir(path.parent)

@@ -4,7 +4,7 @@ from typing import Any, Iterator, Optional
 
 from .types import Event, ABSENT, validate_value
 from .log import Log
-from .saver import Saver
+from .saver import Saver, FsyncMode
 from .snapshot import Snapshot
 from .interval import Interval
 
@@ -25,10 +25,15 @@ class TimeDB:
         save_events: int,
         save_seconds: float,
         segment_bytes: int,
+        fsync_mode: FsyncMode,
     ) -> "TimeDB":
+        if fsync_mode not in ("none", "seal", "save"):
+            raise ValueError(
+                f"fsync_mode must be 'none', 'seal', or 'save', got {fsync_mode!r}"
+            )
         log = Log.in_memory()
         saver = Saver.open(
-            log, Path(path), save_events, save_seconds, segment_bytes,
+            log, Path(path), save_events, save_seconds, segment_bytes, fsync_mode,
         )
         saver.start()
         return cls(log, saver)

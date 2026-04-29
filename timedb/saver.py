@@ -1,7 +1,9 @@
+import fcntl
+import os
 from dataclasses import dataclass, asdict
 from pathlib import Path
 from threading import Thread, Condition, Lock
-from typing import Optional, Iterator
+from typing import Literal, Optional, Iterator
 
 import immutables
 
@@ -11,6 +13,9 @@ from . import segment
 
 
 _MANIFEST_NAME = "manifest"
+_LOCK_NAME = "LOCK"
+
+FsyncMode = Literal["none", "seal", "save"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -37,6 +42,8 @@ class Saver:
         save_events: int,
         save_seconds: float,
         segment_bytes: int,
+        fsync_mode: FsyncMode,
+        lock_fd: int,
     ):
         self._log = log
         self._directory = directory
@@ -45,6 +52,8 @@ class Saver:
         self._save_events = save_events
         self._save_seconds = save_seconds
         self._segment_bytes = segment_bytes
+        self._fsync_mode = fsync_mode
+        self._lock_fd: Optional[int] = lock_fd
 
         self._meta_lock = Lock()
         self._persisted_count = active.last_seq + 1 if active else 0
@@ -61,8 +70,23 @@ class Saver:
         save_events: int,
         save_seconds: float,
         segment_bytes: int,
+        fsync_mode: FsyncMode,
     ) -> "Saver":
         directory.mkdir(parents=True, exist_ok=True)
+
+        lock_fd = os.open(
+            str(directory / _LOCK_NAME),
+            os.O_CREAT | os.O_RDWR,
+            0o644,
+        )
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            os.close(lock_fd)
+            raise RuntimeError(
+                f"Database at {directory} is already open by another process"
+            )
+
         manifest_path = directory / _MANIFEST_NAME
 
         if manifest_path.exists():
@@ -98,6 +122,7 @@ class Saver:
         saver = cls(
             log, directory, sealed, active,
             save_events, save_seconds, segment_bytes,
+            fsync_mode, lock_fd,
         )
         log.attach(saver)
         return saver
@@ -135,6 +160,10 @@ class Saver:
             self._closing = True
             self._wake.notify()
         self._save_thread.join()
+        if self._lock_fd is not None:
+            fcntl.flock(self._lock_fd, fcntl.LOCK_UN)
+            os.close(self._lock_fd)
+            self._lock_fd = None
         if self._save_error is not None:
             raise self._save_error
 
@@ -177,14 +206,21 @@ class Saver:
         else:
             base_root = _EMPTY
 
+        existing_max = 0
         if self._active:
-            active_num = segment.segment_num(self._active.filename)
+            existing_max = segment.segment_num(self._active.filename)
         elif self._sealed:
-            active_num = segment.segment_num(self._sealed[-1].filename) + 1
-        else:
-            active_num = 1
+            existing_max = segment.segment_num(self._sealed[-1].filename)
+        next_num = existing_max + 1
 
         chunks = segment.bin_events_by_size(active_events, self._segment_bytes)
+        has_seal = len(chunks) > 1
+        fsync_active = self._fsync_mode == "save"
+        fsync_sealed = self._fsync_mode in ("save", "seal")
+        fsync_manifest = (
+            self._fsync_mode == "save"
+            or (self._fsync_mode == "seal" and has_seal)
+        )
 
         new_segments: list[SegmentMeta] = []
         chunk_end_states: list[immutables.Map] = []
@@ -196,11 +232,17 @@ class Saver:
                 elif e.key in state:
                     state = state.delete(e.key)
             chunk_end_states.append(state)
-            chunk_num = active_num + i
+            chunk_num = next_num + i
+            is_active = i == len(chunks) - 1
+            do_fsync = fsync_active if is_active else fsync_sealed
             log_filename = segment.segment_filename(chunk_num)
-            segment.atomic_write_events(self._directory / log_filename, chunk)
+            segment.atomic_write_events(
+                self._directory / log_filename, chunk, do_fsync
+            )
             segment.atomic_write_state(
-                self._directory / segment.state_filename(chunk_num), state
+                self._directory / segment.state_filename(chunk_num),
+                state,
+                do_fsync,
             )
             new_segments.append(SegmentMeta(
                 filename=log_filename,
@@ -214,18 +256,37 @@ class Saver:
         segment.write_manifest(
             self._directory / _MANIFEST_NAME,
             {"segments": [asdict(s) for s in all_metas]},
+            fsync_manifest,
         )
+
+        self._delete_orphans(all_metas)
 
         with self._meta_lock:
             self._sealed = new_sealed
             self._active = new_active
 
-        if len(chunks) > 1:
+        if has_seal:
             new_active_first_seq = chunks[-1][0].seq
             new_active_base = chunk_end_states[-2]
             self._log.truncate_active(new_active_first_seq, new_active_base)
 
         return new_active.last_seq + 1
+
+    def _delete_orphans(self, kept: list[SegmentMeta]):
+        kept_nums = {segment.segment_num(s.filename) for s in kept}
+        for path in self._directory.iterdir():
+            name = path.name
+            if name == _MANIFEST_NAME or name == _LOCK_NAME:
+                continue
+            if not (name.endswith(".log") or name.endswith(".state")):
+                path.unlink(missing_ok=True)
+                continue
+            try:
+                num = segment.segment_num(name)
+            except ValueError:
+                continue
+            if num not in kept_nums:
+                path.unlink(missing_ok=True)
 
     def event_at(self, seq: int) -> Event:
         with self._meta_lock:

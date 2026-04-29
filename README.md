@@ -43,11 +43,20 @@ print(snap.get("user.name"))  # "bob"
 
 ```python
 with TimeDB.open(path, save_events=1000, save_seconds=5.0,
-                 segment_bytes=64 * 1024 * 1024) as db:
+                 segment_bytes=64 * 1024 * 1024,
+                 fsync_mode="seal") as db:
     db.put("user.name", "alice")
 ```
 
 A background thread writes events to segment files in `path/`. Writes are durable up to `save_events` events / `save_seconds` seconds behind. Call `db.flush()` to block until persisted.
+
+`fsync_mode` controls power-loss durability:
+
+- `"none"` — no fsync. Writes go to the OS page cache only.
+- `"seal"` — fsync sealed segment files (and the manifest when sealing happens). The active segment may be lost on power loss, but everything before the most recent seal is durable.
+- `"save"` — fsync every write. After `db.flush()` returns, all events are power-loss durable.
+
+Opening a database also acquires an exclusive flock on `path/LOCK`. A second process trying to open the same path raises `RuntimeError`. The lock is released on context-manager exit, or by the kernel if the process crashes.
 
 ### Time travel
 
@@ -138,6 +147,5 @@ The constraint comes from the on-disk log being JSONL: it should stay readable f
 ## Limitations
 
 - Memory grows forever (no compaction).
-- Single-process. No lockfile.
-- No fsync. Segment writes go to OS page cache only.
 - Single writer at a time. Snapshot reads are concurrent-safe via HAMT.
+- No read-only mode yet. A second open of the same path is rejected by the lockfile, even for queries.

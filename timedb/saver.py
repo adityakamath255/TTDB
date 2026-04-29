@@ -28,6 +28,7 @@ class Saver:
         save_seconds: float,
         segment_bytes: int,
     ):
+        # immutable
         self._log = log
         self._directory = directory
         self._sealed = sealed
@@ -35,6 +36,8 @@ class Saver:
         self._save_events = save_events
         self._save_seconds = save_seconds
         self._segment_bytes = segment_bytes
+
+        # mutable
         self._persisted_through_seq = active.last_seq if active else -1
         self._wake = Condition()
         self._closing = False

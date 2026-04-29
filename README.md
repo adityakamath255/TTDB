@@ -6,9 +6,14 @@ An append-only key-value store for Python that retains full history. Every write
 
 ## How it works
 
-All writes go into a log as `Event` objects with a sequence number, key, value, timestamp, and optional transaction ID. The current value of any key is read from a HAMT root snapshot at that sequence number. Deletion is a write of the sentinel value `ABSENT`.
+All writes go into a log as `Event` objects with a sequence number, key, value, timestamp, and optional transaction ID. Append-only is the core invariant; everything else derives from it. Deletion is a write of the sentinel value `ABSENT`, which also represents "never existed" — one sentinel covers both cases. If you need to distinguish them, walk the event history.
 
-A `Snapshot` is a view of the log frozen at a specific sequence number. Lookups go straight through the persistent root, so creating a snapshot is cheap regardless of log size.
+The log is queried through two view types:
+
+- `Snapshot` — the value-view at a single seq. `get`, `keys`, `items`, `diff`. Lookups go through a persistent HAMT root, so creating a snapshot is cheap regardless of log size.
+- `Interval` — the event-view across a seq window. `history`, `keys_touched`, `tx_ids`, `count`, and iteration over events. Holds bounds plus a log reference; creating one is cheap.
+
+The split mirrors the question being asked: "what is the world at this moment?" goes through Snapshot; "what happened in this window?" goes through Interval.
 
 ---
 
@@ -93,7 +98,21 @@ for event in db.between(seq0, seq1):
     print(event.seq, event.key, event.value)
 ```
 
-`between(seq0, seq1)` yields events `(seq0, seq1]` (exclusive at the low end so it pairs naturally with `db.at(seq0)` / `db.at(seq1)`).
+`between(seq0, seq1)` returns an `Interval`: a view over events in `(seq0, seq1]` (half-open at the low end so it pairs naturally with `db.at(seq0)` / `db.at(seq1)`). Iterating an Interval yields its events. It also exposes:
+
+- `iv.history(key)` — events whose key matches, in seq order
+- `iv.keys_touched()` — set of distinct keys with at least one event in the interval
+- `iv.tx_ids()` — set of distinct tx_ids in the interval (singleton writes excluded)
+- `iv.count()` — number of events in the interval
+
+### History of a key
+
+```python
+for event in db.history("user.name"):
+    print(event.seq, event.value, event.timestamp)
+```
+
+`db.history(key)` is shorthand for the full-log case: `db.between(-1, latest).history(key)`.
 
 ### Transactions
 
@@ -111,6 +130,8 @@ Single-key writes via `put` and `delete` have `tx_id = None`.
 ## Values
 
 Accepted value types are `str`, `int`, `float`, `bool`, `None`, and arbitrarily nested `list` and `dict` combinations with string keys. Any other type raises `TypeError` at write time.
+
+The constraint comes from the on-disk log being JSONL: it should stay readable from any language. Validation runs at write time, not save time, so the error lands close to the mistake.
 
 ---
 

@@ -6,6 +6,7 @@ from .types import Event, ABSENT, validate_value
 from .log import Log
 from .saver import Saver
 from .snapshot import Snapshot
+from .interval import Interval
 
 
 class TimeDB:
@@ -67,14 +68,17 @@ class TimeDB:
     def events(self) -> Sequence[Event]:
         return self._log.events()
 
-    def between(self, seq0: int, seq1: int) -> Iterator[Event]:
+    def between(self, seq0: int, seq1: int) -> Interval:
         n = self._log.latest()
         if not (seq0 <= seq1 <= n):
             raise ValueError(
                 f"invalid range: seq0={seq0}, seq1={seq1}, "
                 f"log has {n + 1} events"
             )
-        return self._log.events_between(seq0, seq1)
+        return Interval(self._log, seq0, seq1)
+
+    def history(self, key: str) -> Iterator[Event]:
+        return self.between(-1, self._log.latest()).history(key)
 
     def apply(self, writes: dict[str, Any]) -> tuple[int, int]:
         return self.apply_at(writes, datetime.now())

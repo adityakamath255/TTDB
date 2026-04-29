@@ -5,6 +5,7 @@ import pytest
 from conftest import SEG, SEG_TINY, SAVE_EVENTS, SAVE_SECONDS
 from timedb.types import Event, ABSENT
 from timedb.db import TimeDB
+from timedb.interval import Interval
 
 
 T0 = datetime(2025, 1, 1)
@@ -197,6 +198,96 @@ def test_between_invalid_range_raises(seq0, seq1):
     db = make_db(("a", 0, T0), ("b", 1, T1))
     with pytest.raises(ValueError):
         list(db.between(seq0, seq1))
+
+
+# -- interval --
+
+def test_between_returns_interval():
+    db = make_db(("x", 1, T0))
+    assert isinstance(db.between(-1, 0), Interval)
+
+def test_interval_iterates_events():
+    db = make_db(("a", 0, T0), ("b", 1, T1), ("c", 2, T2))
+    assert [e.seq for e in db.between(0, 2)] == [1, 2]
+
+def test_interval_history_filters_by_key():
+    db = make_db(
+        ("x", 1, T0), ("y", 2, T1), ("x", 3, T2), ("z", 4, T3), ("x", 5, T4),
+    )
+    assert [e.value for e in db.between(-1, 4).history("x")] == [1, 3, 5]
+
+def test_interval_history_within_bounds():
+    db = make_db(("x", 1, T0), ("x", 2, T1), ("x", 3, T2), ("x", 4, T3))
+    assert [e.value for e in db.between(0, 2).history("x")] == [2, 3]
+
+def test_interval_history_missing_key_empty():
+    db = make_db(("x", 1, T0))
+    assert list(db.between(-1, 0).history("missing")) == []
+
+def test_interval_keys_touched():
+    db = make_db(("x", 1, T0), ("y", 2, T1), ("x", 3, T2), ("z", 4, T3))
+    assert db.between(-1, 3).keys_touched() == {"x", "y", "z"}
+
+def test_interval_keys_touched_within_bounds():
+    db = make_db(("x", 1, T0), ("y", 2, T1), ("z", 3, T2))
+    assert db.between(0, 2).keys_touched() == {"y", "z"}
+
+def test_interval_keys_touched_empty_range():
+    db = make_db(("x", 1, T0))
+    assert db.between(0, 0).keys_touched() == set()
+
+def test_interval_tx_ids_excludes_singletons():
+    db = TimeDB.in_memory()
+    db.put_at("a", 1, T0)
+    tx, _ = db.apply_at({"x": 1, "y": 2}, T1)
+    db.put_at("b", 3, T2)
+    assert db.between(-1, 3).tx_ids() == {tx}
+
+def test_interval_tx_ids_multiple():
+    db = TimeDB.in_memory()
+    tx1, _ = db.apply_at({"a": 1, "b": 2}, T0)
+    tx2, _ = db.apply_at({"c": 3, "d": 4}, T1)
+    assert db.between(-1, 3).tx_ids() == {tx1, tx2}
+
+def test_interval_tx_ids_empty_when_only_singletons():
+    db = make_db(("x", 1, T0), ("y", 2, T1))
+    assert db.between(-1, 1).tx_ids() == set()
+
+def test_interval_count():
+    db = make_db(("a", 0, T0), ("b", 1, T1), ("c", 2, T2), ("d", 3, T3))
+    assert db.between(-1, 3).count() == 4
+    assert db.between(0, 3).count() == 3
+    assert db.between(1, 3).count() == 2
+    assert db.between(2, 2).count() == 0
+
+def test_interval_count_empty_log():
+    db = TimeDB.in_memory()
+    assert db.between(-1, -1).count() == 0
+
+def test_interval_count_matches_iter():
+    db = make_db(("a", 0, T0), ("b", 1, T1), ("c", 2, T2))
+    iv = db.between(-1, 2)
+    assert iv.count() == len(list(iv))
+
+
+# -- db.history shorthand --
+
+def test_db_history_returns_all_events_for_key():
+    db = make_db(("x", 1, T0), ("y", 2, T1), ("x", 3, T2), ("x", 5, T3))
+    assert [e.value for e in db.history("x")] == [1, 3, 5]
+
+def test_db_history_includes_deletes():
+    db = make_db(("x", 1, T0))
+    db.delete_at("x", T1)
+    assert [e.value for e in db.history("x")] == [1, ABSENT]
+
+def test_db_history_missing_key_empty():
+    db = make_db(("x", 1, T0))
+    assert list(db.history("missing")) == []
+
+def test_db_history_empty_log():
+    db = TimeDB.in_memory()
+    assert list(db.history("x")) == []
 
 
 # -- diff --

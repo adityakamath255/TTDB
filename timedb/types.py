@@ -2,6 +2,8 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Optional
 
+import immutables
+
 
 class _Absent:
     def __repr__(self) -> str:
@@ -18,6 +20,14 @@ class Event:
     value: Any
     timestamp: datetime
     tx_id: Optional[int]
+
+
+def apply(root: immutables.Map, event: "Event") -> immutables.Map:
+    if event.value is not ABSENT:
+        return root.set(event.key, event.value)
+    if event.key in root:
+        return root.delete(event.key)
+    return root
 
 
 def _validate_json(value: Any):

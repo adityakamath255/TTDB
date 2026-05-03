@@ -1,20 +1,18 @@
 from typing import Any, Optional, Iterator, Iterable
 from threading import Lock
 from datetime import datetime
-from contextlib import nullcontext, AbstractContextManager
 
 import immutables
 
-from .types import Event, ABSENT
+from .types import Event, apply
 
 
 _EMPTY = immutables.Map()
 
 
 class Log:
-    def __init__(self, listener: AbstractContextManager):
-        self._listener = listener
-        self._sealed_reader = None
+    def __init__(self):
+        self._saver: Any = None
         self._events: list[Event] = []
         self._active_first_seq: int = 0
         self._active_base_root: immutables.Map = _EMPTY
@@ -23,11 +21,10 @@ class Log:
 
     @classmethod
     def in_memory(cls) -> "Log":
-        return cls(nullcontext())
+        return cls()
 
-    def attach(self, collaborator):
-        self._listener = collaborator
-        self._sealed_reader = collaborator
+    def attach(self, saver):
+        self._saver = saver
 
     def bootstrap(
         self,
@@ -51,10 +48,7 @@ class Log:
             self._active_base_root = new_base_root
 
     def _index(self, event: Event):
-        if event.value is not ABSENT:
-            self._latest_root = self._latest_root.set(event.key, event.value)
-        elif event.key in self._latest_root:
-            self._latest_root = self._latest_root.delete(event.key)
+        self._latest_root = apply(self._latest_root, event)
         self._events.append(event)
 
     def _publish(
@@ -72,26 +66,33 @@ class Log:
         return seq
 
     def write(self, key: str, value: Any, at: datetime) -> int:
-        with self._listener, self._lock:
-            return self._publish(key, value, at, None)
+        if self._saver is not None:
+            self._saver.before_write()
+        with self._lock:
+            seq = self._publish(key, value, at, None)
+        if self._saver is not None:
+            self._saver.after_write()
+        return seq
 
     def write_tx(
         self, writes: dict[str, Any], at: datetime
     ) -> tuple[int, int]:
-        with self._listener, self._lock:
+        if self._saver is not None:
+            self._saver.before_write()
+        with self._lock:
             tx_id = self._active_first_seq + len(self._events)
             for key, value in writes.items():
                 self._publish(key, value, at, tx_id)
-            return (tx_id, self._active_first_seq + len(self._events))
+            end = self._active_first_seq + len(self._events)
+        if self._saver is not None:
+            self._saver.after_write()
+        return (tx_id, end)
 
     @staticmethod
     def _replay(base: immutables.Map, events: Iterable[Event]) -> immutables.Map:
         root = base
         for e in events:
-            if e.value is not ABSENT:
-                root = root.set(e.key, e.value)
-            elif e.key in root:
-                root = root.delete(e.key)
+            root = apply(root, e)
         return root
 
     def root_at(self, p: int) -> immutables.Map:
@@ -103,29 +104,29 @@ class Log:
                 base = self._active_base_root
                 events_slice = self._events[: p - self._active_first_seq]
                 return self._replay(base, events_slice)
-        return self._sealed_reader.state_at(p)
+        return self._saver.state_at(p)
 
     def event_at(self, seq: int) -> Event:
         with self._lock:
             if seq >= self._active_first_seq:
                 return self._events[seq - self._active_first_seq]
-        return self._sealed_reader.event_at(seq)
+        return self._saver.event_at(seq)
 
     def events(self) -> Iterator[Event]:
         with self._lock:
             active_first = self._active_first_seq
             active_snapshot = list(self._events)
-        if self._sealed_reader is not None and active_first > 0:
-            yield from self._sealed_reader.events_between(0, active_first)
+        if self._saver is not None and active_first > 0:
+            yield from self._saver.events_between(0, active_first)
         yield from active_snapshot
 
     def events_between(self, lo: int, hi: int) -> Iterator[Event]:
         with self._lock:
             active_first = self._active_first_seq
             active_snapshot = list(self._events)
-        if lo < active_first and self._sealed_reader is not None:
+        if lo < active_first and self._saver is not None:
             sealed_hi = min(hi, active_first)
-            yield from self._sealed_reader.events_between(lo, sealed_hi)
+            yield from self._saver.events_between(lo, sealed_hi)
         active_lo = max(lo, active_first)
         active_hi = min(hi, active_first + len(active_snapshot))
         for i in range(active_lo, active_hi):

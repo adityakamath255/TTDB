@@ -8,7 +8,7 @@ from typing import Literal, Optional, Iterator
 import immutables
 
 from .log import Log, _EMPTY
-from .types import Event, ABSENT
+from .types import Event, apply
 from . import segment
 
 
@@ -130,15 +130,13 @@ class Saver:
     def start(self):
         self._save_thread.start()
 
-    def __enter__(self):
+    def before_write(self):
         if self._save_error is not None:
             raise self._save_error
         if self._closing:
             raise RuntimeError("Saver is closed")
 
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        if exc_type is not None:
-            return
+    def after_write(self):
         n = self._log.count()
         if n - self._persisted_count >= self._save_events:
             with self._wake:
@@ -227,10 +225,7 @@ class Saver:
         state = base_root
         for i, chunk in enumerate(chunks):
             for e in chunk:
-                if e.value is not ABSENT:
-                    state = state.set(e.key, e.value)
-                elif e.key in state:
-                    state = state.delete(e.key)
+                state = apply(state, e)
             chunk_end_states.append(state)
             chunk_num = next_num + i
             is_active = i == len(chunks) - 1
@@ -333,9 +328,6 @@ class Saver:
                 for e in events:
                     if e.seq >= p:
                         break
-                    if e.value is not ABSENT:
-                        root = root.set(e.key, e.value)
-                    elif e.key in root:
-                        root = root.delete(e.key)
+                    root = apply(root, e)
                 return root
         raise IndexError(f"position {p} not in sealed range")

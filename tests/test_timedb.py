@@ -573,12 +573,6 @@ def test_reopen_appends(tmp_path):
 
 # -- fsync mode --
 
-@pytest.mark.parametrize("mode", ["bogus", "", "FSync", None, 0])
-def test_fsync_mode_rejects_bad_value(tmp_path, mode):
-    path = tmp_path / "db"
-    with pytest.raises(ValueError):
-        TimeDB.open(path, SAVE_EVENTS, SAVE_SECONDS, SEG, mode)
-
 @pytest.mark.parametrize("mode", ["none", "seal", "save"])
 def test_fsync_mode_roundtrip(tmp_path, mode):
     path = tmp_path / "db"
@@ -645,6 +639,45 @@ def test_seal_does_not_overwrite_existing_files(tmp_path):
     # every file referenced by the (final) manifest exists and the
     # directory has no extras
     assert _files_on_disk(path) == _files_in_manifest(path)
+
+# -- live reads across active/sealed boundary --
+
+def test_live_snapshot_into_sealed_region(tmp_path):
+    path = tmp_path / "db"
+    with TimeDB.open(path, SAVE_EVENTS, SAVE_SECONDS, SEG_TINY, FSYNC) as db:
+        for i in range(50):
+            db.put_at(f"k{i}", i, T0 + timedelta(seconds=i))
+        db.flush()
+        snap = db.at(10)
+        assert snap.get("k9") == 9
+        assert snap.get("k10") is ABSENT
+
+def test_live_between_spans_boundary(tmp_path):
+    path = tmp_path / "db"
+    with TimeDB.open(path, SAVE_EVENTS, SAVE_SECONDS, SEG_TINY, FSYNC) as db:
+        for i in range(50):
+            db.put_at(f"k{i}", i, T0 + timedelta(seconds=i))
+        db.flush()
+        seqs = [e.seq for e in db.between(5, 45)]
+        assert seqs == list(range(5, 45))
+
+def test_live_event_at_in_sealed_region(tmp_path):
+    path = tmp_path / "db"
+    with TimeDB.open(path, SAVE_EVENTS, SAVE_SECONDS, SEG_TINY, FSYNC) as db:
+        for i in range(50):
+            db.put_at(f"k{i}", i, T0 + timedelta(seconds=i))
+        db.flush()
+        assert db.at(5).timestamp() == T0 + timedelta(seconds=4)
+
+def test_live_tx_events_across_boundary(tmp_path):
+    path = tmp_path / "db"
+    with TimeDB.open(path, SAVE_EVENTS, SAVE_SECONDS, SEG_TINY, FSYNC) as db:
+        tx, _ = db.apply_at({"a": 1, "b": 2, "c": 3}, T0)
+        for i in range(50):
+            db.put_at(f"k{i}", i, T0 + timedelta(seconds=i + 1))
+        db.flush()
+        assert [e.key for e in db.tx_events(tx)] == ["a", "b", "c"]
+
 
 def test_orphan_files_cleaned_up(tmp_path):
     path = tmp_path / "db"

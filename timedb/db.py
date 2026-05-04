@@ -79,6 +79,9 @@ class TimeDB:
     def latest(self) -> Snapshot:
         return Snapshot(self._log, self._log.count())
 
+    def at_time(self, t: datetime) -> Snapshot:
+        return Snapshot(self._log, self._log.position_at_time(t))
+
     def events(self) -> Iterator[Event]:
         return self._log.events()
 

@@ -16,12 +16,28 @@ from .types import Event, ABSENT
 class SegmentMeta:
     num: int
     last_seq: int
+    last_timestamp: datetime
 
     def filename(self) -> str:
         return f"{self.num:06d}.log"
 
     def state_filename(self) -> str:
         return f"{self.num:06d}.state"
+
+    def to_dict(self) -> dict:
+        return {
+            "num": self.num,
+            "last_seq": self.last_seq,
+            "last_timestamp": self.last_timestamp.isoformat(),
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "SegmentMeta":
+        return cls(
+            num=d["num"],
+            last_seq=d["last_seq"],
+            last_timestamp=datetime.fromisoformat(d["last_timestamp"]),
+        )
 
 
 def _serialize_value(value: Any) -> dict:

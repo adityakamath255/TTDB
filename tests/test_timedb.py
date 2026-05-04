@@ -702,11 +702,11 @@ def test_orphan_cleanup_leaves_unknown_files_alone(tmp_path):
 # -- atomic save invariant --
 
 def _manifest_files(path):
-    from timedb.segment import read_manifest, SegmentMeta
+    from timedb.segment import read_manifest, meta_from_dict
     raw = read_manifest(path / "manifest")
     out = set()
     for s in raw["segments"]:
-        m = SegmentMeta(num=s["num"], last_seq=s["last_seq"])
+        m = meta_from_dict(s)
         out.add(m.filename())
         out.add(m.state_filename())
     return out
@@ -719,6 +719,93 @@ def test_every_manifest_file_exists(tmp_path):
             db.flush()
     on_disk = {p.name for p in path.iterdir()}
     assert _manifest_files(path) <= on_disk
+
+
+# -- at_time --
+
+def test_at_time_basic():
+    db = make_db(("x", 1, T0), ("y", 2, T1), ("x", 3, T2))
+    assert db.at_time(T0).get("x") == 1
+    assert db.at_time(T1).get("y") == 2
+    assert db.at_time(T2).get("x") == 3
+
+def test_at_time_includes_event_at_exact_timestamp():
+    db = make_db(("x", 1, T0), ("y", 2, T2))
+    snap = db.at_time(T0)
+    assert snap.get("x") == 1
+    assert snap.get("y") is ABSENT
+
+def test_at_time_between_events():
+    db = make_db(("x", 1, T0), ("y", 2, T2))
+    snap = db.at_time(T1)
+    assert snap.get("x") == 1
+    assert snap.get("y") is ABSENT
+
+def test_at_time_before_all_events():
+    db = make_db(("x", 1, T1), ("y", 2, T2))
+    snap = db.at_time(T0)
+    assert snap.seq() == 0
+    assert snap.get("x") is ABSENT
+
+def test_at_time_after_all_events():
+    db = make_db(("x", 1, T0), ("y", 2, T1))
+    snap = db.at_time(T4)
+    assert dict(snap.items()) == {"x": 1, "y": 2}
+
+def test_at_time_empty_db():
+    db = TimeDB.in_memory()
+    snap = db.at_time(T0)
+    assert snap.seq() == 0
+    assert list(snap.items()) == []
+
+def test_at_time_multiple_events_same_timestamp_all_included():
+    db = make_db(("x", 1, T0), ("y", 2, T0), ("z", 3, T0))
+    assert dict(db.at_time(T0).items()) == {"x": 1, "y": 2, "z": 3}
+
+def test_at_time_includes_deletes():
+    db = make_db(("x", 1, T0))
+    db.delete_at("x", T1)
+    assert db.at_time(T0).get("x") == 1
+    assert db.at_time(T1).get("x") is ABSENT
+
+def test_at_time_persistent_active_only(tmp_path):
+    path = tmp_path / "db"
+    with TimeDB.open(path, SAVE_EVENTS, SAVE_SECONDS, SEG, FSYNC) as db:
+        db.put_at("x", 1, T0)
+        db.put_at("y", 2, T2)
+        assert db.at_time(T1).get("x") == 1
+        assert db.at_time(T1).get("y") is ABSENT
+        assert db.at_time(T2).get("y") == 2
+
+def test_at_time_persistent_sealed_only_after_reopen(tmp_path):
+    path = tmp_path / "db"
+    with TimeDB.open(path, SAVE_EVENTS, SAVE_SECONDS, SEG_TINY, FSYNC) as db:
+        for i in range(50):
+            db.put_at(f"k{i}", i, T0 + timedelta(seconds=i))
+    with TimeDB.open(path, SAVE_EVENTS, SAVE_SECONDS, SEG_TINY, FSYNC) as loaded:
+        snap = loaded.at_time(T0 + timedelta(seconds=10))
+        assert snap.get("k10") == 10
+        assert snap.get("k11") is ABSENT
+
+def test_at_time_persistent_across_active_sealed_boundary(tmp_path):
+    path = tmp_path / "db"
+    with TimeDB.open(path, SAVE_EVENTS, SAVE_SECONDS, SEG_TINY, FSYNC) as db:
+        for i in range(50):
+            db.put_at(f"k{i}", i, T0 + timedelta(seconds=i))
+        db.flush()
+        snap = db.at_time(T0 + timedelta(seconds=20))
+        assert snap.get("k20") == 20
+        assert snap.get("k21") is ABSENT
+
+def test_at_time_after_reopen_roundtrip(tmp_path):
+    path = tmp_path / "db"
+    with TimeDB.open(path, SAVE_EVENTS, SAVE_SECONDS, SEG_TINY, FSYNC) as db:
+        for i in range(30):
+            db.put_at(f"k{i}", i, T0 + timedelta(seconds=i))
+    with TimeDB.open(path, SAVE_EVENTS, SAVE_SECONDS, SEG_TINY, FSYNC) as loaded:
+        snap = loaded.at_time(T0 + timedelta(seconds=15))
+        assert snap.get("k15") == 15
+        assert snap.get("k16") is ABSENT
 
 
 # -- live reads across active/sealed boundary --

@@ -1,4 +1,4 @@
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from pathlib import Path
 from threading import Thread, Condition
 from typing import Callable, Optional, Literal
@@ -206,29 +206,34 @@ class Saver:
         next_num = self._next_segment_num()
         last = len(chunks) - 1
         for i, chunk in enumerate(chunks):
-            chunk_last_seq = chunk[-1][0].seq
-            state = self._buffer.state_at(chunk_last_seq + 1)
-            assert state is not None
+            chunk_last = chunk[-1][0]
             do_fsync = fsync.active if i == last else fsync.sealed
             if i == 0 and extend_active:
                 assert self._active is not None
-                num = self._active.num
-                log_path = self._directory / self._active.filename()
-                state_path = self._directory / self._active.state_filename()
+                meta = SegmentMeta(
+                    num=self._active.num,
+                    last_seq=chunk_last.seq,
+                    last_timestamp=chunk_last.timestamp,
+                )
                 segment.append_lines(
-                    log_path, (line for _, line in chunk), do_fsync,
+                    self._directory / meta.filename(),
+                    (line for _, line in chunk), do_fsync,
                 )
             else:
-                num = next_num
-                next_num += 1
-                paths = SegmentMeta(num=num, last_seq=chunk_last_seq)
-                log_path = self._directory / paths.filename()
-                state_path = self._directory / paths.state_filename()
-                segment.atomic_write_lines(
-                    log_path, (line for _, line in chunk), do_fsync,
+                meta = SegmentMeta(
+                    num=next_num,
+                    last_seq=chunk_last.seq,
+                    last_timestamp=chunk_last.timestamp,
                 )
-            segment.atomic_write_state(state_path, state, do_fsync)
-            metas.append(SegmentMeta(num=num, last_seq=chunk_last_seq))
+                next_num += 1
+                segment.atomic_write_lines(
+                    self._directory / meta.filename(),
+                    (line for _, line in chunk), do_fsync,
+                )
+            state = self._buffer.state_at(chunk_last.seq + 1)
+            assert state is not None
+            segment.atomic_write_state(self._directory / meta.state_filename(), state, do_fsync)
+            metas.append(meta)
         return metas
 
     def _publish_manifest_update(
@@ -245,7 +250,7 @@ class Saver:
         all_metas = sealed_existing + new_sealed + [new_metas[-1]]
         segment.write_manifest(
             self._manifest_path,
-            {"segments": [asdict(s) for s in all_metas]},
+            {"segments": [s.to_dict() for s in all_metas]},
             fsync_manifest,
         )
 

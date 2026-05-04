@@ -1,3 +1,5 @@
+from bisect import bisect_right
+from datetime import datetime
 from pathlib import Path
 from threading import Lock
 from typing import Iterator, Optional
@@ -93,3 +95,17 @@ class Archive:
                     root = apply(root, e)
                 return root
         raise IndexError(f"position {p} not in archive")
+
+    def position_at_time(self, t: datetime) -> int:
+        sealed = self.segments()
+        if not sealed:
+            return 0
+        seg_idx = bisect_right(sealed, t, key=lambda s: s.last_timestamp)
+        if seg_idx == len(sealed):
+            return sealed[-1].last_seq + 1
+        seg = sealed[seg_idx]
+        first = _first_seq(sealed, seg_idx)
+        assert self._directory is not None
+        events = segment.read_events(self._directory / seg.filename())
+        idx = bisect_right(events, t, key=lambda e: e.timestamp)
+        return first + idx

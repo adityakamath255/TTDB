@@ -1,3 +1,4 @@
+from bisect import bisect_right
 from threading import Lock
 from typing import Any, Iterable, Optional
 from datetime import datetime
@@ -78,3 +79,10 @@ class Buffer:
             self._events = self._events[drop:]
             self._roots = self._roots[drop:]
             self._lo = new_lo
+
+    def position_at_time(self, t: datetime) -> Optional[int]:
+        with self._lock:
+            if not self._events or t < self._events[0].timestamp:
+                return None
+            idx = bisect_right(self._events, t, key=lambda e: e.timestamp)
+            return self._lo + idx

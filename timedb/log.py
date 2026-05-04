@@ -1,6 +1,5 @@
 import fcntl
 import os
-from dataclasses import asdict
 from typing import Optional, Any, Iterator
 from pathlib import Path
 from datetime import datetime
@@ -24,10 +23,7 @@ def _load_segments(
 ) -> tuple[list[SegmentMeta], Optional[SegmentMeta], "Archive", int]:
     if manifest_path.exists():
         raw = segment.read_manifest(manifest_path)
-        metas = [
-            SegmentMeta(num=s["num"], last_seq=s["last_seq"])
-            for s in raw["segments"]
-        ]
+        metas = [SegmentMeta.from_dict(s) for s in raw["segments"]]
     else:
         metas = []
     sealed_metas = metas[:-1] if metas else []
@@ -97,13 +93,17 @@ class Log:
                 )
                 if len(active_events) < expected_count:
                     if active_events:
-                        active = SegmentMeta(active.num, active_events[-1].seq)
+                        active = SegmentMeta(
+                            active.num,
+                            active_events[-1].seq,
+                            active_events[-1].timestamp,
+                        )
                     else:
                         active = None
                     fixed = sealed_metas + ([active] if active else [])
                     segment.write_manifest(
                         manifest_path,
-                        {"segments": [asdict(s) for s in fixed]},
+                        {"segments": [s.to_dict() for s in fixed]},
                         fsync_mode == "save",
                     )
                 base_state = archive.head_state()
@@ -195,6 +195,14 @@ class Log:
         if buf_lo > 0 and self._archive is not None:
             yield from self._archive.events_between(0, buf_lo)
         yield from buf_events
+
+    def position_at_time(self, t: datetime) -> int:
+        p = self._buffer.position_at_time(t)
+        if p is not None:
+            return p
+        if self._archive is not None:
+            return self._archive.position_at_time(t)
+        return 0
 
     def tx_exists(self, tx_id: int) -> bool:
         if tx_id < 0 or tx_id >= self.count():

@@ -122,49 +122,61 @@ class Saver:
         return self._buffer.next_seq() > self._persisted_count()
 
     def _persist_buffer(self):
-        _, all_events = self._buffer.snapshot()
-        if not all_events:
+        plan = self._plan_chunks()
+        if plan is None:
             return
-
-        if self._active is not None:
-            first_new_idx = self._active.last_seq - all_events[0].seq + 1
-        else:
-            first_new_idx = 0
-        new_events = all_events[first_new_idx:]
-        if not new_events:
-            return
-
-        if self._active is not None:
-            active_log = self._directory / self._active.filename()
-            remaining = max(0, self._segment_bytes - active_log.stat().st_size)
-        else:
-            remaining = 0
-
-        if remaining > 0:
-            chunks = segment.bin_events_by_size(
-                new_events, self._segment_bytes, first_chunk_capacity=remaining,
-            )
-            extend_active = True
-        else:
-            chunks = segment.bin_events_by_size(new_events, self._segment_bytes)
-            extend_active = False
-
+        chunks, extend_active = plan
         prior_active = self._active
         has_seal = len(chunks) > 1 or (not extend_active and prior_active is not None)
         fsync = self._fsync_policy(has_seal=has_seal)
-
         new_metas = self._write_chunks(chunks, fsync, extend_active)
         self._publish_manifest_update(new_metas, prior_active, extend_active, fsync.manifest)
+        self._commit_save(new_metas, prior_active, extend_active, has_seal, chunks)
 
+    def _plan_chunks(
+        self,
+    ) -> Optional[tuple[list[list[SerializedEvent]], bool]]:
+        _, all_events = self._buffer.snapshot()
+        if not all_events:
+            return None
+        first_new_idx = (
+            self._active.last_seq - all_events[0].seq + 1
+            if self._active is not None else 0
+        )
+        new_events = all_events[first_new_idx:]
+        if not new_events:
+            return None
+        if self._active is not None:
+            remaining = max(
+                0, self._segment_bytes
+                - (self._directory / self._active.filename()).stat().st_size
+            )
+        else:
+            remaining = 0
+        if remaining > 0:
+            return (
+                segment.bin_events_by_size(
+                    new_events, self._segment_bytes, first_chunk_capacity=remaining,
+                ),
+                True,
+            )
+        return segment.bin_events_by_size(new_events, self._segment_bytes), False
+
+    def _commit_save(
+        self,
+        new_metas: list[SegmentMeta],
+        prior_active: Optional[SegmentMeta],
+        extend_active: bool,
+        has_seal: bool,
+        chunks: list[list[SerializedEvent]],
+    ):
         new_sealed = list(new_metas[:-1])
         if not extend_active and prior_active is not None:
             new_sealed = [prior_active] + new_sealed
         for meta in new_sealed:
             self._archive.add_sealed(meta)
         self._active = new_metas[-1]
-
         self._delete_orphans()
-
         if has_seal:
             self._buffer.truncate_to(chunks[-1][0][0].seq)
 

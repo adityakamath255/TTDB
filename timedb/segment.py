@@ -151,6 +151,22 @@ def recover_active_log(path: Path, expected_count: int) -> list[Event]:
     return events
 
 
+def read_active_events(path: Path, count: int) -> list[Event]:
+    if not path.exists():
+        return []
+    events: list[Event] = []
+    with open(path) as f:
+        for _ in range(count):
+            line = f.readline()
+            if not line or not line.endswith("\n"):
+                break
+            try:
+                events.append(_deserialize_event(json.loads(line)))
+            except (json.JSONDecodeError, KeyError):
+                break
+    return events
+
+
 def read_manifest(path: Path) -> dict:
     with open(path) as f:
         return json.load(f)

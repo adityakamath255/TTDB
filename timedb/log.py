@@ -19,6 +19,24 @@ MANIFEST_NAME = "manifest"
 LOCK_NAME = "LOCK"
 
 
+def _load_segments(
+    directory: Path, manifest_path: Path
+) -> tuple[list[SegmentMeta], Optional[SegmentMeta], "Archive", int]:
+    if manifest_path.exists():
+        raw = segment.read_manifest(manifest_path)
+        metas = [
+            SegmentMeta(num=s["num"], last_seq=s["last_seq"])
+            for s in raw["segments"]
+        ]
+    else:
+        metas = []
+    sealed_metas = metas[:-1] if metas else []
+    active = metas[-1] if metas else None
+    archive = Archive(directory, sealed_metas)
+    buffer_lo = sealed_metas[-1].last_seq + 1 if sealed_metas else 0
+    return sealed_metas, active, archive, buffer_lo
+
+
 def _acquire_lock(path: Path) -> int:
     fd = os.open(str(path), os.O_WRONLY | os.O_CREAT, 0o644)
     try:
@@ -68,23 +86,9 @@ class Log:
         try:
             _sweep_tmp_files(directory)
             manifest_path = directory / MANIFEST_NAME
-
-            if manifest_path.exists():
-                raw = segment.read_manifest(manifest_path)
-                metas = [
-                    SegmentMeta(num=s["num"], last_seq=s["last_seq"])
-                    for s in raw["segments"]
-                ]
-            else:
-                metas = []
-
-            if metas:
-                sealed_metas, active = metas[:-1], metas[-1]
-            else:
-                sealed_metas, active = [], None
-
-            archive = Archive(directory, sealed_metas)
-            buffer_lo = sealed_metas[-1].last_seq + 1 if sealed_metas else 0
+            sealed_metas, active, archive, buffer_lo = _load_segments(
+                directory, manifest_path,
+            )
 
             if active is not None:
                 expected_count = active.last_seq - buffer_lo + 1
@@ -119,6 +123,24 @@ class Log:
             raise
 
         return cls(buffer, archive, saver, lock_fd)
+
+    @classmethod
+    def open_readonly(cls, directory: Path) -> "Log":
+        manifest_path = directory / MANIFEST_NAME
+        sealed_metas, active, archive, buffer_lo = _load_segments(
+            directory, manifest_path,
+        )
+        if active is not None:
+            expected_count = active.last_seq - buffer_lo + 1
+            active_events = segment.read_active_events(
+                directory / active.filename(), expected_count,
+            )
+            base_state = archive.head_state() if sealed_metas else EMPTY
+            buffer = Buffer(buffer_lo, base_state, active_events)
+        else:
+            base_state = archive.head_state() if sealed_metas else EMPTY
+            buffer = Buffer(buffer_lo, base_state)
+        return cls(buffer, archive, None, None)
 
     def append(self, key: str, value: Any, at: datetime) -> int:
         if self._saver is not None:

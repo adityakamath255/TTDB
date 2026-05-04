@@ -10,12 +10,17 @@ from .interval import Interval
 
 
 class TimeDB:
-    def __init__(self, log: Log):
+    def __init__(self, log: Log, readonly: bool):
         self._log = log
+        self._readonly = readonly
 
     @classmethod
     def in_memory(cls) -> "TimeDB":
-        return cls(Log.in_memory())
+        return cls(Log.in_memory(), False)
+
+    @classmethod
+    def open_readonly(cls, path: str | Path) -> "TimeDB":
+        return cls(Log.open_readonly(Path(path)), True)
 
     @classmethod
     def open(
@@ -27,10 +32,13 @@ class TimeDB:
         fsync_mode: FsyncMode,
         on_error: Optional[OnError] = None,
     ) -> "TimeDB":
-        return cls(Log.open(
-            Path(path), save_events, save_seconds, segment_bytes,
-            fsync_mode, on_error,
-        ))
+        return cls(
+            Log.open(
+                Path(path), save_events, save_seconds, segment_bytes,
+                fsync_mode, on_error,
+            ),
+            False
+        )
 
     def health_check(self):
         self._log.health_check()
@@ -48,6 +56,8 @@ class TimeDB:
         return self.put_at(key, value, datetime.now())
 
     def put_at(self, key: str, value: Any, at: datetime) -> int:
+        if self._readonly:
+            raise PermissionError("database is open read-only")
         validate_value(value)
         seq = self._log.append(key, value, at)
         return seq
@@ -90,6 +100,8 @@ class TimeDB:
     def apply_at(
         self, writes: dict[str, Any], at: datetime
     ) -> tuple[int, int]:
+        if self._readonly:
+            raise PermissionError("database is open read-only")
         if not writes:
             raise ValueError("apply requires a non-empty writes dict")
         for value in writes.values():

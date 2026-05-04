@@ -22,7 +22,10 @@ class Buffer:
             self._events.append(e)
             self._roots.append(apply(self._roots[-1], e))
 
-    def count(self) -> int:
+    def first_seq(self) -> int:
+        return self._lo
+
+    def next_seq(self) -> int:
         with self._lock:
             return self._lo + len(self._events)
 

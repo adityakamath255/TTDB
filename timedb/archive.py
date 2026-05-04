@@ -1,4 +1,3 @@
-from dataclasses import dataclass
 from pathlib import Path
 from threading import Lock
 from typing import Iterator, Optional
@@ -6,21 +5,8 @@ from typing import Iterator, Optional
 import immutables
 
 from . import segment
+from .segment import SegmentMeta
 from .types import Event, EMPTY, apply
-
-
-@dataclass(frozen=True, slots=True)
-class SegmentMeta:
-    num: int
-    last_seq: int
-
-    @property
-    def filename(self) -> str:
-        return segment.segment_filename(self.num)
-
-    @property
-    def state_filename(self) -> str:
-        return segment.state_filename(self.num)
 
 
 def _first_seq(segments: list[SegmentMeta], idx: int) -> int:
@@ -39,10 +25,6 @@ class Archive:
         self._segments = list(segments)
         self._lock = Lock()
 
-    @classmethod
-    def empty(cls) -> "Archive":
-        return cls(None, [])
-
     def segments(self) -> list[SegmentMeta]:
         with self._lock:
             return list(self._segments)
@@ -54,7 +36,7 @@ class Archive:
             last = self._segments[-1]
             directory = self._directory
         assert directory is not None
-        return segment.read_state(directory / last.state_filename)
+        return segment.read_state(directory / last.state_filename())
 
     def add_sealed(self, meta: SegmentMeta):
         with self._lock:
@@ -66,7 +48,7 @@ class Archive:
             first = _first_seq(sealed, idx)
             if first <= seq <= seg.last_seq:
                 assert self._directory is not None
-                events = segment.read_events(self._directory / seg.filename)
+                events = segment.read_events(self._directory / seg.filename())
                 return events[seq - first]
         raise IndexError(f"seq {seq} not in archive")
 
@@ -80,7 +62,7 @@ class Archive:
             if lo > last:
                 continue
             assert self._directory is not None
-            events = segment.read_events(self._directory / seg.filename)
+            events = segment.read_events(self._directory / seg.filename())
             for e in events:
                 if lo <= e.seq < hi:
                     yield e
@@ -92,18 +74,18 @@ class Archive:
             if p == end_pos:
                 assert self._directory is not None
                 return segment.read_state(
-                    self._directory / seg.state_filename
+                    self._directory / seg.state_filename()
                 )
             if p < end_pos:
                 assert self._directory is not None
                 base = (
                     segment.read_state(
-                        self._directory / sealed[idx - 1].state_filename
+                        self._directory / sealed[idx - 1].state_filename()
                     )
                     if idx > 0
                     else EMPTY
                 )
-                events = segment.read_events(self._directory / seg.filename)
+                events = segment.read_events(self._directory / seg.filename())
                 root = base
                 for e in events:
                     if e.seq >= p:

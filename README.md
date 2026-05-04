@@ -58,6 +58,8 @@ A background thread writes events to segment files in `path/`. Writes are durabl
 
 Opening a database also acquires an exclusive flock on `path/LOCK`. A second process trying to open the same path raises `RuntimeError`. The lock is released on context-manager exit, or by the kernel if the process crashes.
 
+If a previous writer crashed mid-save, leftover `*.tmp` files from in-flight atomic writes are swept on the next open. Committed files are never overwritten, so the manifest still references intact data.
+
 ### Time travel
 
 ```python
@@ -146,5 +148,5 @@ The constraint comes from the on-disk log being JSONL: it should stay readable f
 
 ## Limitations
 
-- Single writer at a time. Snapshot reads are concurrent-safe via HAMT.
-- No read-only mode yet. A second open of the same path is rejected by the lockfile, even for queries.
+- Single writer at a time. The lockfile rejects concurrent opens, even for queries.
+- No read-only mode yet.

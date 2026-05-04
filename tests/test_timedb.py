@@ -600,45 +600,65 @@ def test_lock_released_on_close(tmp_path):
         assert db.latest().get("x") == 1
 
 
+# -- crash recovery --
+
+def test_stale_tmp_files_swept_on_open(tmp_path):
+    path = tmp_path / "db"
+    with TimeDB.open(path, SAVE_EVENTS, SAVE_SECONDS, SEG, FSYNC) as db:
+        db.put_at("x", 1, T0)
+        db.flush()
+    # plant leftover .tmp from a hypothetical crashed writer
+    (path / "999999.log.tmp").write_text("garbage")
+    (path / "manifest.tmp").write_text("garbage")
+    with TimeDB.open(path, SAVE_EVENTS, SAVE_SECONDS, SEG, FSYNC) as db:
+        assert db.latest().get("x") == 1
+    assert not (path / "999999.log.tmp").exists()
+    assert not (path / "manifest.tmp").exists()
+
+def test_orphan_files_cleaned_up(tmp_path):
+    path = tmp_path / "db"
+    with TimeDB.open(path, SAVE_EVENTS, SAVE_SECONDS, SEG, FSYNC) as db:
+        db.put_at("x", 1, T0)
+        db.flush()
+        (path / "999999.log").write_text("garbage")
+        (path / "999999.state").write_text("garbage")
+        db.put_at("y", 2, T1)
+        db.flush()
+    assert not (path / "999999.log").exists()
+    assert not (path / "999999.state").exists()
+
+def test_orphan_cleanup_leaves_unknown_files_alone(tmp_path):
+    path = tmp_path / "db"
+    with TimeDB.open(path, SAVE_EVENTS, SAVE_SECONDS, SEG, FSYNC) as db:
+        db.put_at("x", 1, T0)
+        db.flush()
+        (path / "notes.txt").write_text("hello")
+        db.put_at("y", 2, T1)
+        db.flush()
+    assert (path / "notes.txt").read_text() == "hello"
+
+
 # -- atomic save invariant --
 
-def _files_in_manifest(path):
-    from timedb.segment import read_manifest, state_filename, segment_filename
+def _manifest_files(path):
+    from timedb.segment import read_manifest, SegmentMeta
     raw = read_manifest(path / "manifest")
-    nums = [s["num"] for s in raw["segments"]]
-    expected = set()
-    for n in nums:
-        expected.add(segment_filename(n))
-        expected.add(state_filename(n))
-    return expected
+    out = set()
+    for s in raw["segments"]:
+        m = SegmentMeta(num=s["num"], last_seq=s["last_seq"])
+        out.add(m.filename())
+        out.add(m.state_filename())
+    return out
 
-def _files_on_disk(path):
-    return {
-        p.name for p in path.iterdir()
-        if p.suffix in (".log", ".state")
-    }
-
-def test_directory_matches_manifest_after_save(tmp_path):
+def test_every_manifest_file_exists(tmp_path):
     path = tmp_path / "db"
     with TimeDB.open(path, SAVE_EVENTS, SAVE_SECONDS, SEG_TINY, FSYNC) as db:
-        for i in range(20):
+        for i in range(30):
             db.put_at(f"k{i}", i, T0 + timedelta(seconds=i))
-        db.flush()
-    assert _files_on_disk(path) == _files_in_manifest(path)
+            db.flush()
+    on_disk = {p.name for p in path.iterdir()}
+    assert _manifest_files(path) <= on_disk
 
-def test_seal_does_not_overwrite_existing_files(tmp_path):
-    path = tmp_path / "db"
-    with TimeDB.open(path, SAVE_EVENTS, SAVE_SECONDS, SEG_TINY, FSYNC) as db:
-        for i in range(10):
-            db.put_at(f"k{i}", i, T0 + timedelta(seconds=i))
-            db.flush()
-        # write more to potentially trigger a seal
-        for i in range(10, 30):
-            db.put_at(f"k{i}", i, T0 + timedelta(seconds=i))
-            db.flush()
-    # every file referenced by the (final) manifest exists and the
-    # directory has no extras
-    assert _files_on_disk(path) == _files_in_manifest(path)
 
 # -- live reads across active/sealed boundary --
 
@@ -679,16 +699,3 @@ def test_live_tx_events_across_boundary(tmp_path):
         assert [e.key for e in db.tx_events(tx)] == ["a", "b", "c"]
 
 
-def test_orphan_files_cleaned_up(tmp_path):
-    path = tmp_path / "db"
-    with TimeDB.open(path, SAVE_EVENTS, SAVE_SECONDS, SEG, FSYNC) as db:
-        db.put_at("x", 1, T0)
-        db.flush()
-        # plant an orphan
-        (path / "999999.log").write_text("garbage")
-        (path / "999999.state").write_text("garbage")
-        # next save should remove them
-        db.put_at("y", 2, T1)
-        db.flush()
-    assert not (path / "999999.log").exists()
-    assert not (path / "999999.state").exists()

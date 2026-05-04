@@ -2,23 +2,20 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterator, Optional
 
-from .types import Event, EMPTY, ABSENT, validate_value
-from .buffer import Buffer
-from .archive import Archive
+from .types import Event, ABSENT, validate_value
 from .log import Log
-from .saver import Saver, FsyncMode, open_database
+from .saver import FsyncMode, OnError
 from .snapshot import Snapshot
 from .interval import Interval
 
 
 class TimeDB:
-    def __init__(self, log: Log, saver: Optional[Saver]):
+    def __init__(self, log: Log):
         self._log = log
-        self._saver = saver
 
     @classmethod
     def in_memory(cls) -> "TimeDB":
-        return cls(Log(Buffer(0, EMPTY), Archive.empty()), None)
+        return cls(Log.in_memory())
 
     @classmethod
     def open(
@@ -28,34 +25,31 @@ class TimeDB:
         save_seconds: float,
         segment_bytes: int,
         fsync_mode: FsyncMode,
+        on_error: Optional[OnError] = None,
     ) -> "TimeDB":
-        log, saver = open_database(
-            Path(path), save_events, save_seconds, segment_bytes, fsync_mode,
-        )
-        saver.start()
-        return cls(log, saver)
+        return cls(Log.open(
+            Path(path), save_events, save_seconds, segment_bytes,
+            fsync_mode, on_error,
+        ))
+
+    def health_check(self):
+        self._log.health_check()
 
     def flush(self):
-        if self._saver is not None:
-            self._saver.flush()
+        self._log.flush()
 
     def __enter__(self) -> "TimeDB":
         return self
 
     def __exit__(self, *exc):
-        if self._saver is not None:
-            self._saver.close()
+        self._log.close()
 
     def put(self, key: str, value: Any) -> int:
         return self.put_at(key, value, datetime.now())
 
     def put_at(self, key: str, value: Any, at: datetime) -> int:
         validate_value(value)
-        if self._saver is not None:
-            self._saver.check_writable()
         seq = self._log.append(key, value, at)
-        if self._saver is not None:
-            self._saver.signal_pending()
         return seq
 
     def delete(self, key: str) -> int:
@@ -100,11 +94,7 @@ class TimeDB:
             raise ValueError("apply requires a non-empty writes dict")
         for value in writes.values():
             validate_value(value)
-        if self._saver is not None:
-            self._saver.check_writable()
         result = self._log.append_tx(writes, at)
-        if self._saver is not None:
-            self._saver.signal_pending()
         return result
 
     def tx_events(self, tx_id: int) -> Iterator[Event]:

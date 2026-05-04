@@ -67,7 +67,7 @@ def serialize_event(event: Event) -> str:
     return json.dumps(_serialize_event(event))
 
 
-@lru_cache(maxsize=4)
+@lru_cache(maxsize=64)
 def read_events(path: Path) -> list[Event]:
     with open(path) as f:
         return [_deserialize_event(json.loads(line)) for line in f]
@@ -98,23 +98,57 @@ def atomic_write_lines(
 
 
 def bin_events_by_size(
-    events: Iterable[Event], max_bytes: int
+    events: Iterable[Event],
+    max_bytes: int,
+    first_chunk_capacity: Optional[int] = None,
 ) -> list[list[SerializedEvent]]:
+    capacity = max_bytes if first_chunk_capacity is None else first_chunk_capacity
     chunks: list[list[SerializedEvent]] = []
     current: list[SerializedEvent] = []
     current_size = 0
     for event in events:
         line = serialize_event(event)
         line_size = len(line) + 1
-        if current and current_size + line_size > max_bytes:
+        if current and current_size + line_size > capacity:
             chunks.append(current)
             current = []
             current_size = 0
+            capacity = max_bytes
         current.append((event, line))
         current_size += line_size
     if current:
         chunks.append(current)
     return chunks
+
+
+def append_lines(path: Path, lines: Iterable[str], fsync: bool):
+    with open(path, "a") as f:
+        for line in lines:
+            f.write(line)
+            f.write("\n")
+        if fsync:
+            f.flush()
+            os.fsync(f.fileno())
+
+
+def recover_active_log(path: Path, expected_count: int) -> list[Event]:
+    if not path.exists():
+        return []
+    events: list[Event] = []
+    with open(path, "rb+") as f:
+        valid_pos = 0
+        for _ in range(expected_count):
+            line = f.readline()
+            if not line or not line.endswith(b"\n"):
+                break
+            try:
+                event = _deserialize_event(json.loads(line))
+            except (json.JSONDecodeError, KeyError):
+                break
+            events.append(event)
+            valid_pos = f.tell()
+        f.truncate(valid_pos)
+    return events
 
 
 def read_manifest(path: Path) -> dict:
@@ -143,7 +177,7 @@ def parse_segment_filename(name: str) -> Optional[int]:
     return int(m.group(1)) if m else None
 
 
-@lru_cache(maxsize=4)
+@lru_cache(maxsize=64)
 def read_state(path: Path) -> immutables.Map:
     items: dict = {}
     with open(path) as f:

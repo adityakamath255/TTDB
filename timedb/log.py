@@ -1,5 +1,6 @@
 import fcntl
 import os
+from dataclasses import asdict
 from typing import Optional, Any, Iterator
 from pathlib import Path
 from datetime import datetime
@@ -64,45 +65,58 @@ class Log:
 
         directory.mkdir(parents=True, exist_ok=True)
         lock_fd = _acquire_lock(directory / LOCK_NAME)
-        _sweep_tmp_files(directory)
-        manifest_path = directory / MANIFEST_NAME
+        try:
+            _sweep_tmp_files(directory)
+            manifest_path = directory / MANIFEST_NAME
 
-        if manifest_path.exists():
-            raw = segment.read_manifest(manifest_path)
-            metas = [
-                SegmentMeta(num=s["num"], last_seq=s["last_seq"])
-                for s in raw["segments"]
-            ]
-        else:
-            metas = []
-
-        if metas:
-            sealed_metas, active = metas[:-1], metas[-1]
-        else:
-            sealed_metas, active = [], None
-
-        archive = Archive(directory, sealed_metas)
-
-        if active:
-            if sealed_metas:
-                buffer_lo = sealed_metas[-1].last_seq + 1
+            if manifest_path.exists():
+                raw = segment.read_manifest(manifest_path)
+                metas = [
+                    SegmentMeta(num=s["num"], last_seq=s["last_seq"])
+                    for s in raw["segments"]
+                ]
             else:
-                buffer_lo = 0
+                metas = []
 
-            base_state = archive.head_state()
-            active_events = segment.read_events(directory / active.filename())
+            if metas:
+                sealed_metas, active = metas[:-1], metas[-1]
+            else:
+                sealed_metas, active = [], None
 
-            buffer = Buffer(buffer_lo, base_state, active_events)
+            archive = Archive(directory, sealed_metas)
+            buffer_lo = sealed_metas[-1].last_seq + 1 if sealed_metas else 0
 
-        else:
-            buffer = Buffer(0, EMPTY, [])
+            if active is not None:
+                expected_count = active.last_seq - buffer_lo + 1
+                active_events = segment.recover_active_log(
+                    directory / active.filename(), expected_count,
+                )
+                if len(active_events) < expected_count:
+                    if active_events:
+                        active = SegmentMeta(active.num, active_events[-1].seq)
+                    else:
+                        active = None
+                    fixed = sealed_metas + ([active] if active else [])
+                    segment.write_manifest(
+                        manifest_path,
+                        {"segments": [asdict(s) for s in fixed]},
+                        fsync_mode == "save",
+                    )
+                base_state = archive.head_state()
+                buffer = Buffer(buffer_lo, base_state, active_events)
+            else:
+                base_state = archive.head_state() if sealed_metas else EMPTY
+                buffer = Buffer(buffer_lo, base_state)
 
-        saver = Saver(
-            buffer, archive, directory, manifest_path, active, save_events,
-            save_seconds, segment_bytes, fsync_mode, on_error,
-        )
-
-        saver.start()
+            saver = Saver(
+                buffer, archive, directory, manifest_path, active, save_events,
+                save_seconds, segment_bytes, fsync_mode, on_error,
+            )
+            saver.start()
+        except BaseException:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            os.close(lock_fd)
+            raise
 
         return cls(buffer, archive, saver, lock_fd)
 

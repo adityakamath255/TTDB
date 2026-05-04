@@ -5,7 +5,6 @@ from typing import Callable, Optional, Literal
 
 from . import segment
 from .segment import SegmentMeta, SerializedEvent
-from .types import EMPTY, apply
 from .buffer import Buffer
 from .archive import Archive
 
@@ -123,34 +122,51 @@ class Saver:
         return self._buffer.next_seq() > self._persisted_count()
 
     def _persist_buffer(self):
-        _, events = self._buffer.snapshot()
-        if not events:
+        _, all_events = self._buffer.snapshot()
+        if not all_events:
             return
 
-        chunks = segment.bin_events_by_size(events, self._segment_bytes)
-        base_state = self._archive_head_state()
-        next_num = self._next_segment_num()
-        fsync = self._fsync_policy(has_seal=len(chunks) > 1)
+        if self._active is not None:
+            first_new_idx = self._active.last_seq - all_events[0].seq + 1
+        else:
+            first_new_idx = 0
+        new_events = all_events[first_new_idx:]
+        if not new_events:
+            return
 
-        new_metas = self._write_chunks(chunks, base_state, next_num, fsync)
-        self._publish_manifest_update(new_metas, fsync.manifest)
+        if self._active is not None:
+            active_log = self._directory / self._active.filename()
+            remaining = max(0, self._segment_bytes - active_log.stat().st_size)
+        else:
+            remaining = 0
 
-        for meta in new_metas[:-1]:
+        if remaining > 0:
+            chunks = segment.bin_events_by_size(
+                new_events, self._segment_bytes, first_chunk_capacity=remaining,
+            )
+            extend_active = True
+        else:
+            chunks = segment.bin_events_by_size(new_events, self._segment_bytes)
+            extend_active = False
+
+        prior_active = self._active
+        has_seal = len(chunks) > 1 or (not extend_active and prior_active is not None)
+        fsync = self._fsync_policy(has_seal=has_seal)
+
+        new_metas = self._write_chunks(chunks, fsync, extend_active)
+        self._publish_manifest_update(new_metas, prior_active, extend_active, fsync.manifest)
+
+        new_sealed = list(new_metas[:-1])
+        if not extend_active and prior_active is not None:
+            new_sealed = [prior_active] + new_sealed
+        for meta in new_sealed:
             self._archive.add_sealed(meta)
         self._active = new_metas[-1]
 
         self._delete_orphans()
 
-        if len(chunks) > 1:
+        if has_seal:
             self._buffer.truncate_to(chunks[-1][0][0].seq)
-
-    def _archive_head_state(self):
-        sealed = self._archive.segments()
-        if not sealed:
-            return EMPTY
-        return segment.read_state(
-            self._directory / sealed[-1].state_filename()
-        )
 
     def _next_segment_num(self) -> int:
         if self._active:
@@ -171,33 +187,50 @@ class Saver:
     def _write_chunks(
         self,
         chunks: list[list[SerializedEvent]],
-        base_state,
-        next_num: int,
         fsync: _FsyncPolicy,
+        extend_active: bool,
     ) -> list[SegmentMeta]:
         metas: list[SegmentMeta] = []
-        state = base_state
+        next_num = self._next_segment_num()
         last = len(chunks) - 1
         for i, chunk in enumerate(chunks):
-            for event, _ in chunk:
-                state = apply(state, event)
+            chunk_last_seq = chunk[-1][0].seq
+            state = self._buffer.state_at(chunk_last_seq + 1)
+            assert state is not None
             do_fsync = fsync.active if i == last else fsync.sealed
-            meta = SegmentMeta(num=next_num + i, last_seq=chunk[-1][0].seq)
-            segment.atomic_write_lines(
-                self._directory / meta.filename(),
-                (line for _, line in chunk),
-                do_fsync,
-            )
-            segment.atomic_write_state(
-                self._directory / meta.state_filename(), state, do_fsync,
-            )
-            metas.append(meta)
+            if i == 0 and extend_active:
+                assert self._active is not None
+                num = self._active.num
+                log_path = self._directory / self._active.filename()
+                state_path = self._directory / self._active.state_filename()
+                segment.append_lines(
+                    log_path, (line for _, line in chunk), do_fsync,
+                )
+            else:
+                num = next_num
+                next_num += 1
+                paths = SegmentMeta(num=num, last_seq=chunk_last_seq)
+                log_path = self._directory / paths.filename()
+                state_path = self._directory / paths.state_filename()
+                segment.atomic_write_lines(
+                    log_path, (line for _, line in chunk), do_fsync,
+                )
+            segment.atomic_write_state(state_path, state, do_fsync)
+            metas.append(SegmentMeta(num=num, last_seq=chunk_last_seq))
         return metas
 
     def _publish_manifest_update(
-        self, new_metas: list[SegmentMeta], fsync_manifest: bool
+        self,
+        new_metas: list[SegmentMeta],
+        prior_active: Optional[SegmentMeta],
+        extend_active: bool,
+        fsync_manifest: bool,
     ):
-        all_metas = self._archive.segments() + new_metas[:-1] + [new_metas[-1]]
+        sealed_existing = self._archive.segments()
+        new_sealed = list(new_metas[:-1])
+        if not extend_active and prior_active is not None:
+            new_sealed = [prior_active] + new_sealed
+        all_metas = sealed_existing + new_sealed + [new_metas[-1]]
         segment.write_manifest(
             self._manifest_path,
             {"segments": [asdict(s) for s in all_metas]},

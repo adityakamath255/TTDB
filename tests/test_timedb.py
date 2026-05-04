@@ -600,6 +600,35 @@ def test_lock_released_on_close(tmp_path):
         assert db.latest().get("x") == 1
 
 
+# -- active segment stability --
+
+def test_active_num_stable_across_appends(tmp_path):
+    from timedb.segment import read_manifest
+    path = tmp_path / "db"
+    with TimeDB.open(path, SAVE_EVENTS, SAVE_SECONDS, SEG, FSYNC) as db:
+        db.put_at("x", 1, T0)
+        db.flush()
+        nums_after_first = [s["num"] for s in read_manifest(path / "manifest")["segments"]]
+        for i in range(20):
+            db.put_at(f"k{i}", i, T0 + timedelta(seconds=i + 1))
+            db.flush()
+        nums_after_many = [s["num"] for s in read_manifest(path / "manifest")["segments"]]
+    assert nums_after_first == nums_after_many
+
+def test_active_log_appended_not_rewritten(tmp_path):
+    path = tmp_path / "db"
+    with TimeDB.open(path, SAVE_EVENTS, SAVE_SECONDS, SEG, FSYNC) as db:
+        db.put_at("x", 1, T0)
+        db.flush()
+        log_path = next(path.glob("*.log"))
+        size_before = log_path.stat().st_size
+        for i in range(10):
+            db.put_at(f"k{i}", i, T0 + timedelta(seconds=i + 1))
+            db.flush()
+        size_after = log_path.stat().st_size
+    assert size_after > size_before
+
+
 # -- crash recovery --
 
 def test_stale_tmp_files_swept_on_open(tmp_path):
@@ -626,6 +655,38 @@ def test_orphan_files_cleaned_up(tmp_path):
         db.flush()
     assert not (path / "999999.log").exists()
     assert not (path / "999999.state").exists()
+
+def test_recover_truncates_uncommitted_bytes(tmp_path):
+    path = tmp_path / "db"
+    with TimeDB.open(path, SAVE_EVENTS, SAVE_SECONDS, SEG, FSYNC) as db:
+        db.put_at("x", 1, T0)
+        db.put_at("y", 2, T1)
+        db.flush()
+    log_path = next(path.glob("*.log"))
+    with open(log_path, "ab") as f:
+        f.write(b'{"seq": 99, "key": "ghost", "value": {"type": "data", "data": 0}, "timestamp": "2025-01-01T00:00:00", "tx_id": null}\n')
+        f.write(b'{"seq": 100, "key": "partial')  # no trailing newline
+    size_before = log_path.stat().st_size
+    with TimeDB.open(path, SAVE_EVENTS, SAVE_SECONDS, SEG, FSYNC) as db:
+        assert dict(db.latest().items()) == {"x": 1, "y": 2}
+        assert db.latest().seq() == 2
+    assert log_path.stat().st_size < size_before
+    assert "ghost" not in {e.key for e in TimeDB.open(
+        path, SAVE_EVENTS, SAVE_SECONDS, SEG, FSYNC
+    ).events()}
+
+def test_recover_partial_last_line_dropped(tmp_path):
+    path = tmp_path / "db"
+    with TimeDB.open(path, SAVE_EVENTS, SAVE_SECONDS, SEG, FSYNC) as db:
+        db.put_at("x", 1, T0)
+        db.flush()
+    log_path = next(path.glob("*.log"))
+    with open(log_path, "ab") as f:
+        f.write(b'{"seq": 1, "key": "trun')  # partial, no \n
+    with TimeDB.open(path, SAVE_EVENTS, SAVE_SECONDS, SEG, FSYNC) as db:
+        assert db.latest().get("x") == 1
+        assert db.latest().seq() == 1
+
 
 def test_orphan_cleanup_leaves_unknown_files_alone(tmp_path):
     path = tmp_path / "db"

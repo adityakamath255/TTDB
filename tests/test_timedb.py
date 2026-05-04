@@ -603,9 +603,9 @@ def test_lock_released_on_close(tmp_path):
 # -- atomic save invariant --
 
 def _files_in_manifest(path):
-    from timedb.segment import read_manifest, segment_num, state_filename, segment_filename
+    from timedb.segment import read_manifest, state_filename, segment_filename
     raw = read_manifest(path / "manifest")
-    nums = [segment_num(s["filename"]) for s in raw["segments"]]
+    nums = [s["num"] for s in raw["segments"]]
     expected = set()
     for n in nums:
         expected.add(segment_filename(n))

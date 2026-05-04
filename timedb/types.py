@@ -11,6 +11,7 @@ class _Absent:
 
 
 ABSENT = _Absent()
+EMPTY: immutables.Map = immutables.Map()
 
 
 @dataclass(frozen=True, slots=True)

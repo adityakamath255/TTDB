@@ -2,9 +2,11 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterator, Optional
 
-from .types import Event, ABSENT, validate_value
+from .types import Event, EMPTY, ABSENT, validate_value
+from .buffer import Buffer
+from .archive import Archive
 from .log import Log
-from .saver import Saver, FsyncMode
+from .saver import Saver, FsyncMode, open_database
 from .snapshot import Snapshot
 from .interval import Interval
 
@@ -16,7 +18,7 @@ class TimeDB:
 
     @classmethod
     def in_memory(cls) -> "TimeDB":
-        return cls(Log.in_memory(), None)
+        return cls(Log(Buffer(0, EMPTY), Archive.empty()), None)
 
     @classmethod
     def open(
@@ -27,9 +29,8 @@ class TimeDB:
         segment_bytes: int,
         fsync_mode: FsyncMode,
     ) -> "TimeDB":
-        log = Log.in_memory()
-        saver = Saver.open(
-            log, Path(path), save_events, save_seconds, segment_bytes, fsync_mode,
+        log, saver = open_database(
+            Path(path), save_events, save_seconds, segment_bytes, fsync_mode,
         )
         saver.start()
         return cls(log, saver)
@@ -50,7 +51,12 @@ class TimeDB:
 
     def put_at(self, key: str, value: Any, at: datetime) -> int:
         validate_value(value)
-        return self._log.write(key, value, at)
+        if self._saver is not None:
+            self._saver.check_writable()
+        seq = self._log.append(key, value, at)
+        if self._saver is not None:
+            self._saver.signal_pending()
+        return seq
 
     def delete(self, key: str) -> int:
         return self.put(key, ABSENT)
@@ -94,7 +100,12 @@ class TimeDB:
             raise ValueError("apply requires a non-empty writes dict")
         for value in writes.values():
             validate_value(value)
-        return self._log.write_tx(writes, at)
+        if self._saver is not None:
+            self._saver.check_writable()
+        result = self._log.append_tx(writes, at)
+        if self._saver is not None:
+            self._saver.signal_pending()
+        return result
 
     def tx_events(self, tx_id: int) -> Iterator[Event]:
         if not self._log.tx_exists(tx_id):

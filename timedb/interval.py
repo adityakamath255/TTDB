@@ -14,24 +14,13 @@ class Interval:
         return self._log.events_between(self._lo, self._hi)
 
     def history(self, key: str) -> Iterator[Event]:
-        return (
-            e 
-            for e in self._log.events_between(self._lo, self._hi)
-            if e.key == key
-        )
+        return (e for e in self if e.key == key)
 
     def keys_touched(self) -> set[str]:
-        return {
-            e.key
-            for e in self._log.events_between(self._lo, self._hi)
-        }
+        return {e.key for e in self}
 
     def tx_ids(self) -> set[int]:
-        return {
-            e.tx_id
-            for e in self._log.events_between(self._lo, self._hi)
-            if e.tx_id is not None
-        }
+        return {e.tx_id for e in self if e.tx_id is not None}
 
     def count(self) -> int:
         return self._hi - self._lo

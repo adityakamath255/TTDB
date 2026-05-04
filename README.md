@@ -146,6 +146,5 @@ The constraint comes from the on-disk log being JSONL: it should stay readable f
 
 ## Limitations
 
-- Memory grows forever (no compaction).
 - Single writer at a time. Snapshot reads are concurrent-safe via HAMT.
 - No read-only mode yet. A second open of the same path is rejected by the lockfile, even for queries.

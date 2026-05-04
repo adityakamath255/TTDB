@@ -1,6 +1,7 @@
 import json
 import os
 from datetime import datetime
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -45,6 +46,7 @@ def _deserialize_event(raw: dict) -> Event:
     )
 
 
+@lru_cache(maxsize=4)
 def read_events(path: str | Path) -> list[Event]:
     with open(path) as f:
         return [_deserialize_event(json.loads(line)) for line in f]
@@ -124,6 +126,7 @@ def segment_num(filename: str) -> int:
     return int(filename.split(".")[0])
 
 
+@lru_cache(maxsize=4)
 def read_state(path: str | Path) -> immutables.Map:
     items: dict = {}
     with open(path) as f:

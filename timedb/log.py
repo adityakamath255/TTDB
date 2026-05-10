@@ -26,6 +26,10 @@ def _load_segments(
         metas = [SegmentMeta.from_dict(s) for s in raw["segments"]]
     else:
         metas = []
+    # Writer invariant: every committed manifest has the active segment as
+    # its trailing entry. The format is positional, not tagged, so this is
+    # what makes the split below well-defined. Saver._publish_manifest_update
+    # is the single producer and must preserve this.
     sealed_metas = metas[:-1] if metas else []
     active = metas[-1] if metas else None
     archive = Archive(directory, sealed_metas)
@@ -63,8 +67,8 @@ class Log:
         self._lock_fd = lock_fd
 
     @classmethod
-    def in_memory(cls) -> "Log":
-        return cls(Buffer(0, EMPTY), None, None)
+    def in_memory(cls, strict_time: bool = False) -> "Log":
+        return cls(Buffer(0, EMPTY, strict_time=strict_time), None, None)
 
     @classmethod
     def open(
@@ -75,6 +79,7 @@ class Log:
         segment_bytes: int,
         fsync_mode: FsyncMode,
         on_error: Optional[OnError] = None,
+        strict_time: bool = False,
     ) -> "Log":
 
         directory.mkdir(parents=True, exist_ok=True)
@@ -106,11 +111,15 @@ class Log:
                         {"segments": [s.to_dict() for s in fixed]},
                         fsync_mode == "save",
                     )
+                # active.num.state may sit on disk reflecting a last_seq past
+                # the truncated active log. Recovery never reads it (we replay
+                # the active log onto head_state), and the next save will
+                # overwrite it. Don't change that without addressing this.
                 base_state = archive.head_state()
-                buffer = Buffer(buffer_lo, base_state, active_events)
+                buffer = Buffer(buffer_lo, base_state, active_events, strict_time=strict_time)
             else:
                 base_state = archive.head_state() if sealed_metas else EMPTY
-                buffer = Buffer(buffer_lo, base_state)
+                buffer = Buffer(buffer_lo, base_state, strict_time=strict_time)
 
             saver = Saver(
                 buffer, archive, directory, manifest_path, active, save_events,

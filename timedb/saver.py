@@ -69,7 +69,10 @@ class Saver:
                 self._wake.notify()
 
     def _persisted_count(self) -> int:
-        return self._active.last_seq + 1 if self._active else 0
+        if self._active is not None:
+            return self._active.last_seq + 1
+        sealed = self._archive.segments()
+        return sealed[-1].last_seq + 1 if sealed else 0
 
     def flush(self):
         if self._save_error is not None:
@@ -127,40 +130,49 @@ class Saver:
             return
         chunks, extend_active = plan
         prior_active = self._active
-        has_seal = len(chunks) > 1 or (not extend_active and prior_active is not None)
+        has_seal = self._has_seal(chunks, extend_active, prior_active)
         fsync = self._fsync_policy(has_seal=has_seal)
         new_metas = self._write_chunks(chunks, fsync, extend_active)
         self._publish_manifest_update(new_metas, prior_active, extend_active, fsync.manifest)
         self._commit_save(new_metas, prior_active, extend_active, has_seal, chunks)
 
+    @staticmethod
+    def _has_seal(
+        chunks: list[list[SerializedEvent]],
+        extend_active: bool,
+        prior_active: Optional[SegmentMeta],
+    ) -> bool:
+        return len(chunks) > 1 or (not extend_active and prior_active is not None)
+
     def _plan_chunks(
         self,
     ) -> Optional[tuple[list[list[SerializedEvent]], bool]]:
+        new_events = self._unsaved_events()
+        if not new_events:
+            return None
+        remaining = self._active_remaining_bytes()
+        extend_active = remaining > 0
+        chunks = segment.bin_events_by_size(
+            new_events, self._segment_bytes,
+            first_chunk_capacity=remaining if extend_active else None,
+        )
+        return chunks, extend_active
+
+    def _unsaved_events(self) -> list:
         _, all_events = self._buffer.snapshot()
         if not all_events:
-            return None
-        first_new_idx = (
+            return []
+        first_new = (
             self._active.last_seq - all_events[0].seq + 1
             if self._active is not None else 0
         )
-        new_events = all_events[first_new_idx:]
-        if not new_events:
-            return None
-        if self._active is not None:
-            remaining = max(
-                0, self._segment_bytes
-                - (self._directory / self._active.filename()).stat().st_size
-            )
-        else:
-            remaining = 0
-        if remaining > 0:
-            return (
-                segment.bin_events_by_size(
-                    new_events, self._segment_bytes, first_chunk_capacity=remaining,
-                ),
-                True,
-            )
-        return segment.bin_events_by_size(new_events, self._segment_bytes), False
+        return all_events[first_new:]
+
+    def _active_remaining_bytes(self) -> int:
+        if self._active is None:
+            return 0
+        used = (self._directory / self._active.filename()).stat().st_size
+        return max(0, self._segment_bytes - used)
 
     def _commit_save(
         self,
@@ -248,6 +260,10 @@ class Saver:
         if not extend_active and prior_active is not None:
             new_sealed = [prior_active] + new_sealed
         all_metas = sealed_existing + new_sealed + [new_metas[-1]]
+        # Writer invariant relied on by _load_segments: the trailing entry
+        # of every committed manifest is the active segment. new_metas[-1]
+        # is what _commit_save will install as self._active.
+        assert new_metas and all_metas[-1] is new_metas[-1]
         segment.write_manifest(
             self._manifest_path,
             {"segments": [s.to_dict() for s in all_metas]},

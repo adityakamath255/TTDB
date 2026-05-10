@@ -15,8 +15,8 @@ class TimeDB:
         self._readonly = readonly
 
     @classmethod
-    def in_memory(cls) -> "TimeDB":
-        return cls(Log.in_memory(), False)
+    def in_memory(cls, strict_time: bool = False) -> "TimeDB":
+        return cls(Log.in_memory(strict_time=strict_time), False)
 
     @classmethod
     def open_readonly(cls, path: str | Path) -> "TimeDB":
@@ -31,11 +31,12 @@ class TimeDB:
         segment_bytes: int,
         fsync_mode: FsyncMode,
         on_error: Optional[OnError] = None,
+        strict_time: bool = False,
     ) -> "TimeDB":
         return cls(
             Log.open(
                 Path(path), save_events, save_seconds, segment_bytes,
-                fsync_mode, on_error,
+                fsync_mode, on_error, strict_time=strict_time,
             ),
             False
         )

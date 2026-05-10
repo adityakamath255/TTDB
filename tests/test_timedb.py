@@ -1,4 +1,8 @@
+import subprocess
+import sys
+import textwrap
 from datetime import datetime, timedelta
+from pathlib import Path
 
 import pytest
 
@@ -80,6 +84,45 @@ def test_accepts_out_of_order_timestamps(ts):
     db = make_db(("anchor", 0, T2))
     db.put_at("x", 1, ts)
     assert db.latest().get("x") == 1
+
+
+# -- strict timestamps --
+
+def test_strict_time_rejects_backwards_write():
+    db = TimeDB.in_memory(strict_time=True)
+    db.put_at("x", 1, T2)
+    with pytest.raises(ValueError, match="strict_time"):
+        db.put_at("y", 2, T0)
+
+def test_strict_time_allows_equal_timestamps():
+    db = TimeDB.in_memory(strict_time=True)
+    db.put_at("x", 1, T1)
+    db.put_at("y", 2, T1)
+    assert db.latest().get("y") == 2
+
+def test_strict_time_allows_forward_writes():
+    db = TimeDB.in_memory(strict_time=True)
+    db.put_at("x", 1, T0)
+    db.put_at("y", 2, T1)
+    db.put_at("z", 3, T2)
+    assert db.latest().get("z") == 3
+
+def test_strict_time_first_write_any_timestamp():
+    db = TimeDB.in_memory(strict_time=True)
+    db.put_at("x", 1, datetime(3000, 1, 1))
+    assert db.latest().get("x") == 1
+
+def test_strict_time_apply_rejects_backwards():
+    db = TimeDB.in_memory(strict_time=True)
+    db.put_at("x", 1, T2)
+    with pytest.raises(ValueError, match="strict_time"):
+        db.apply_at({"a": 1, "b": 2}, T0)
+
+def test_strict_time_off_by_default():
+    db = TimeDB.in_memory()
+    db.put_at("x", 1, T2)
+    db.put_at("y", 2, T0)
+    assert db.latest().get("y") == 2
 
 
 # -- snapshots --
@@ -702,11 +745,11 @@ def test_orphan_cleanup_leaves_unknown_files_alone(tmp_path):
 # -- atomic save invariant --
 
 def _manifest_files(path):
-    from timedb.segment import read_manifest, meta_from_dict
+    from timedb.segment import read_manifest, SegmentMeta
     raw = read_manifest(path / "manifest")
     out = set()
     for s in raw["segments"]:
-        m = meta_from_dict(s)
+        m = SegmentMeta.from_dict(s)
         out.add(m.filename())
         out.add(m.state_filename())
     return out
@@ -847,3 +890,84 @@ def test_live_tx_events_across_boundary(tmp_path):
         assert [e.key for e in db.tx_events(tx)] == ["a", "b", "c"]
 
 
+
+
+# -- crash recovery property test --
+
+def test_recovery_truncation_is_prefix(tmp_path):
+    path = tmp_path / "db"
+    n_events = 12
+    originals = [(f"k{i}", i, T0 + timedelta(seconds=i)) for i in range(n_events)]
+
+    with TimeDB.open(path, save_events=1, save_seconds=0.001,
+                     segment_bytes=SEG_TINY, fsync_mode="save") as db:
+        for k, v, t in originals:
+            db.put_at(k, v, t)
+        db.flush()
+
+    snapshot = {p.name: p.read_bytes() for p in path.iterdir()}
+    log_files = sorted(n for n in snapshot if n.endswith(".log"))
+    active_log = log_files[-1]
+    active_bytes = snapshot[active_log]
+
+    def restore():
+        for p in list(path.iterdir()):
+            p.unlink()
+        for name, content in snapshot.items():
+            (path / name).write_bytes(content)
+
+    offsets = sorted({0, len(active_bytes), len(active_bytes) // 2,
+                      max(0, len(active_bytes) - 5)})
+    for offset in offsets:
+        restore()
+        (path / active_log).write_bytes(active_bytes[:offset])
+
+        with TimeDB.open(path, save_events=SAVE_EVENTS, save_seconds=SAVE_SECONDS,
+                         segment_bytes=SEG_TINY, fsync_mode="none") as db:
+            recovered = [(e.key, e.value, e.timestamp) for e in db.events()]
+
+        assert recovered == originals[:len(recovered)], (
+            f"not a prefix at offset {offset}: {recovered}"
+        )
+
+
+# -- lockfile cross-process test --
+
+def test_lock_prevents_concurrent_writers(tmp_path):
+    path = tmp_path / "db"
+    repo = Path(__file__).parent.parent
+    code = textwrap.dedent(f"""
+        import sys
+        sys.path.insert(0, {repr(str(repo))})
+        from timedb.db import TimeDB
+        try:
+            with TimeDB.open(
+                {repr(str(path))}, save_events=1000, save_seconds=1.0,
+                segment_bytes=4096, fsync_mode="none",
+            ) as db:
+                pass
+            print("OPENED")
+        except RuntimeError as e:
+            print(f"LOCKED:{{e}}")
+    """)
+
+    with TimeDB.open(path, save_events=1000, save_seconds=1.0,
+                     segment_bytes=4096, fsync_mode="none"):
+        result = subprocess.run(
+            [sys.executable, "-c", code],
+            capture_output=True, text=True, timeout=10,
+        )
+
+    assert "LOCKED:" in result.stdout, (
+        f"expected lock conflict; stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+
+def test_lock_released_after_close(tmp_path):
+    path = tmp_path / "db"
+    with TimeDB.open(path, save_events=1000, save_seconds=1.0,
+                     segment_bytes=4096, fsync_mode="none") as db:
+        db.put_at("x", 1, T0)
+
+    with TimeDB.open(path, save_events=1000, save_seconds=1.0,
+                     segment_bytes=4096, fsync_mode="none") as db:
+        assert db.latest().get("x") == 1

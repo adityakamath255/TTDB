@@ -38,6 +38,8 @@ class Archive:
             last = self._segments[-1]
             directory = self._directory
         assert directory is not None
+        # Archive only holds sealed segments; their state files are immutable,
+        # so read_state's cache is safe here.
         return segment.read_state(directory / last.state_filename())
 
     def add_sealed(self, meta: SegmentMeta):
@@ -71,6 +73,8 @@ class Archive:
 
     def state_at(self, p: int) -> immutables.Map:
         sealed = self.segments()
+        # All segments here are sealed; their state files are immutable, so
+        # read_state's cache is safe at every call below.
         for idx, seg in enumerate(sealed):
             end_pos = seg.last_seq + 1
             if p == end_pos:

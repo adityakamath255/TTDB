@@ -69,6 +69,15 @@ print(snap1.get("user.name"))  # "alice"
 
 A Snapshot's seq is a *position* in the log: `at(0)` is the empty state before any events; `at(k)` is the state after the first `k` events have been applied; `at(n)` is the latest. `db.latest()` is shorthand for the snapshot at the current event count.
 
+You can also travel by timestamp:
+
+```python
+snap = db.at_time(some_datetime)
+print(snap.get("user.name"))
+```
+
+at_time(t) returns the snapshot reflecting every event with timestamp ≤ t. Lookup is O(log n) via binary search, which assumes timestamps are written in non-decreasing order. Out-of-order writes still succeed, but at_time results are then undefined. Use at(seq) if you need correctness without that constraint.
+
 ### Deletion
 
 ```python
@@ -145,8 +154,3 @@ Accepted value types are `str`, `int`, `float`, `bool`, `None`, and arbitrarily 
 The constraint comes from the on-disk log being JSONL: it should stay readable from any language. Validation runs at write time, not save time, so the error lands close to the mistake.
 
 ---
-
-## Limitations
-
-- Single writer at a time. The lockfile rejects concurrent opens, even for queries.
-- No read-only mode yet.

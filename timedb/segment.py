@@ -211,6 +211,11 @@ def parse_segment_filename(name: str) -> Optional[int]:
 
 @lru_cache(maxsize=64)
 def read_state(path: Path) -> immutables.Map:
+    # Cache assumes file content at `path` is immutable for this process's
+    # lifetime. Only safe to call on SEALED segment state files. The active
+    # segment's state file is rewritten in place across saves; reading it
+    # through this function would pin the first read forever.
+    assert path.suffix == ".state"
     items: dict = {}
     with open(path) as f:
         for line in f:

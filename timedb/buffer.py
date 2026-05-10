@@ -14,17 +14,18 @@ class Buffer:
         lo: int,
         base_state: immutables.Map,
         events: Iterable[Event] = (),
+        strict_time: bool = False,
     ):
         self._lo = lo
         self._events: list[Event] = []
         self._roots: list[immutables.Map] = [base_state]
         self._lock = Lock()
+        self._strict_time = strict_time
+        self._last_ts: Optional[datetime] = None
         for e in events:
             self._events.append(e)
             self._roots.append(apply(self._roots[-1], e))
-
-    def first_seq(self) -> int:
-        return self._lo
+            self._last_ts = e.timestamp
 
     def next_seq(self) -> int:
         with self._lock:
@@ -51,12 +52,18 @@ class Buffer:
     def _publish(
         self, key: str, value: Any, at: datetime, tx_id: Optional[int]
     ) -> int:
+        if self._strict_time and self._last_ts is not None and at < self._last_ts:
+            raise ValueError(
+                f"strict_time: timestamp {at.isoformat()} is before "
+                f"last event timestamp {self._last_ts.isoformat()}"
+            )
         seq = self._lo + len(self._events)
         event = Event(
             seq=seq, key=key, value=value, timestamp=at, tx_id=tx_id,
         )
         self._events.append(event)
         self._roots.append(apply(self._roots[-1], event))
+        self._last_ts = at
         return seq
 
     def event_at(self, seq: int) -> Optional[Event]:
@@ -81,6 +88,9 @@ class Buffer:
             self._lo = new_lo
 
     def position_at_time(self, t: datetime) -> Optional[int]:
+        # Assumes timestamps are non-decreasing in seq order. Out-of-order
+        # writes make at_time results undefined (per README); a backdated
+        # buffer event will fall through to the archive and silently mislead.
         with self._lock:
             if not self._events or t < self._events[0].timestamp:
                 return None

@@ -11,7 +11,8 @@ class Interval:
         self._hi = hi
 
     def __iter__(self) -> Iterator[Event]:
-        return self._log.events_between(self._lo, self._hi)
+        for i in range(self._lo, self._hi):
+            yield self._log.events()[i]
 
     def history(self, key: str) -> Iterator[Event]:
         return (e for e in self if e.key == key)

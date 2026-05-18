@@ -115,7 +115,7 @@ def test_strict_time_apply_rejects_backwards():
     db = TimeDB.in_memory(strict_time=True)
     db.put("x", 1, T2)
     with pytest.raises(ValueError, match="strict_time"):
-        db.apply_at({"a": 1, "b": 2}, T0)
+        db.apply({"a": 1, "b": 2}, T0)
 
 def test_strict_time_off_by_default():
     db = TimeDB.in_memory()
@@ -158,21 +158,21 @@ def test_empty_db_latest_is_empty_snapshot():
     assert snap.get("anything") is ABSENT
     assert list(snap.keys()) == []
     assert list(snap.items()) == []
-    assert snap.timestamp() is None
+    assert snap.timestamp is None
 
 def test_snapshot_at_zero_is_empty():
     db = make_db(("x", 1, T0))
     snap = db.at(0)
     assert snap.get("x") is ABSENT
     assert list(snap.keys()) == []
-    assert snap.timestamp() is None
+    assert snap.timestamp is None
 
 def test_snapshot_seq():
     db = make_db(("x", 1, T0), ("y", 2, T1))
-    assert db.at(0).seq() == 0
-    assert db.at(1).seq() == 1
-    assert db.at(2).seq() == 2
-    assert db.latest().seq() == 2
+    assert db.at(0).seq == 0
+    assert db.at(1).seq == 1
+    assert db.at(2).seq == 2
+    assert db.latest().seq == 2
 
 def test_snapshot_is_value_survives_close(tmp_path):
     path = tmp_path / "db"
@@ -180,8 +180,8 @@ def test_snapshot_is_value_survives_close(tmp_path):
         db.put("x", 1, T0)
         snap = db.latest()
     assert snap.get("x") == 1
-    assert snap.seq() == 1
-    assert snap.timestamp() == T0
+    assert snap.seq == 1
+    assert snap.timestamp == T0
 
 
 # -- snapshot views --
@@ -207,8 +207,8 @@ def test_keys_after_overwrite_unique():
 
 def test_timestamp_at_seq():
     db = make_db(("x", 1, T0), ("y", 2, T1))
-    assert db.at(1).timestamp() == T0
-    assert db.at(2).timestamp() == T1
+    assert db.at(1).timestamp == T0
+    assert db.at(2).timestamp == T1
 
 
 # -- events --
@@ -296,14 +296,14 @@ def test_interval_keys_touched_empty_range():
 def test_interval_tx_ids_excludes_singletons():
     db = TimeDB.in_memory()
     db.put("a", 1, T0)
-    tx, _ = db.apply_at({"x": 1, "y": 2}, T1)
+    tx, _ = db.apply({"x": 1, "y": 2}, T1)
     db.put("b", 3, T2)
     assert db.between(0, 4).tx_ids() == {tx}
 
 def test_interval_tx_ids_multiple():
     db = TimeDB.in_memory()
-    tx1, _ = db.apply_at({"a": 1, "b": 2}, T0)
-    tx2, _ = db.apply_at({"c": 3, "d": 4}, T1)
+    tx1, _ = db.apply({"a": 1, "b": 2}, T0)
+    tx2, _ = db.apply({"c": 3, "d": 4}, T1)
     assert db.between(0, 4).tx_ids() == {tx1, tx2}
 
 def test_interval_tx_ids_empty_when_only_singletons():
@@ -401,31 +401,30 @@ def test_diff_from_zero():
 
 def test_apply_basic():
     db = TimeDB.in_memory()
-    db.apply_at({"x": 1, "y": 2}, T0)
+    db.apply({"x": 1, "y": 2}, T0)
     snap = db.latest()
     assert snap.get("x") == 1
     assert snap.get("y") == 2
 
 def test_apply_returns_start_and_end():
     db = make_db(("a", 0, T0), ("b", 1, T1))
-    assert db.apply_at({"x": 1, "y": 2}, T2) == (2, 4)
+    assert db.apply({"x": 1, "y": 2}, T2) == (2, 4)
 
-def test_apply_empty_dict_raises():
+def test_apply_empty_dict_is_noop():
     db = TimeDB.in_memory()
-    with pytest.raises(ValueError):
-        db.apply_at({}, T0)
+    assert db.apply({}, T0) == (0, 0)
     assert list(db.events()) == []
 
 def test_apply_shares_timestamp_and_tx_id():
     db = TimeDB.in_memory()
-    tx_id, _ = db.apply_at({"x": 1, "y": 2, "z": 3}, T0)
+    tx_id, _ = db.apply({"x": 1, "y": 2, "z": 3}, T0)
     events = list(db.events())
     assert all(e.timestamp == T0 for e in events)
     assert all(e.tx_id == tx_id for e in events)
 
 def test_apply_with_absent_deletes():
     db = make_db(("x", 1, T0), ("y", 2, T1))
-    db.apply_at({"x": ABSENT, "z": 3}, T2)
+    db.apply({"x": ABSENT, "z": 3}, T2)
     snap = db.latest()
     assert snap.get("x") is ABSENT
     assert snap.get("y") == 2
@@ -443,9 +442,9 @@ def test_apply_uses_now_for_timestamp():
 
 def test_transaction_events_contiguous():
     db = TimeDB.in_memory()
-    tx1, end1 = db.apply_at({"a": 1, "b": 2}, T0)
+    tx1, end1 = db.apply({"a": 1, "b": 2}, T0)
     db.put("singleton", 99, T1)
-    tx2, end2 = db.apply_at({"c": 3, "d": 4, "e": 5}, T2)
+    tx2, end2 = db.apply({"c": 3, "d": 4, "e": 5}, T2)
 
     assert (tx1, end1) == (0, 2)
     assert (tx2, end2) == (3, 6)
@@ -465,7 +464,7 @@ def test_transaction_events_on_singleton_seq_raises():
 
 def test_transaction_events_on_non_first_tx_seq_raises():
     db = TimeDB.in_memory()
-    db.apply_at({"x": 1, "y": 2, "z": 3}, T0)
+    db.apply({"x": 1, "y": 2, "z": 3}, T0)
     with pytest.raises(ValueError):
         db.tx_events(1)
 
@@ -517,7 +516,7 @@ def test_load_preserves_tx_id(tmp_path):
     path = tmp_path / "db"
     with TimeDB.open(path) as db:
         db.put("a", 1, T0)
-        db.apply_at({"x": 10, "y": 20}, T1)
+        db.apply({"x": 10, "y": 20}, T1)
 
     with TimeDB.open(path) as loaded:
         events = list(loaded.events())
@@ -590,16 +589,8 @@ def test_open_readonly_reads_existing(tmp_path):
     db = TimeDB.open_readonly(path)
     assert dict(db.latest().items()) == {"x": 1, "y": 2}
 
-def test_open_readonly_rejects_writes(tmp_path):
-    path = tmp_path / "db"
-    with TimeDB.open(path) as db:
-        db.put("x", 1, T0)
-
-    db = TimeDB.open_readonly(path)
-    with pytest.raises(PermissionError):
-        db.put("y", 2, T1)
-    with pytest.raises(PermissionError):
-        db.apply_at({"a": 1}, T2)
+# Type checker prevents writes on TimeDB.open_readonly results (returns TimeDB,
+# not WritableTimeDB). No runtime test needed: there's no put/apply to call.
 
 
 # -- lockfile --
@@ -633,7 +624,7 @@ def test_recover_truncates_uncommitted_bytes(tmp_path):
 
     with TimeDB.open(path) as db:
         assert dict(db.latest().items()) == {"x": 1, "y": 2, "ghost": 0}
-        assert db.latest().seq() == 3
+        assert db.latest().seq == 3
     assert path.stat().st_size < size_before
 
 
@@ -647,7 +638,7 @@ def test_recover_partial_last_line_dropped(tmp_path):
 
     with TimeDB.open(path) as db:
         assert db.latest().get("x") == 1
-        assert db.latest().seq() == 1
+        assert db.latest().seq == 1
 
 
 def test_unrelated_sibling_files_left_alone(tmp_path):
@@ -660,61 +651,61 @@ def test_unrelated_sibling_files_left_alone(tmp_path):
     assert sibling.read_text() == "hello"
 
 
-# -- at_time --
+# -- as_of--
 
-def test_at_time_basic():
+def test_as_of_basic():
     db = make_db(("x", 1, T0), ("y", 2, T1), ("x", 3, T2))
-    assert db.at_time(T0).get("x") == 1
-    assert db.at_time(T1).get("y") == 2
-    assert db.at_time(T2).get("x") == 3
+    assert db.as_of(T0).get("x") == 1
+    assert db.as_of(T1).get("y") == 2
+    assert db.as_of(T2).get("x") == 3
 
-def test_at_time_includes_event_at_exact_timestamp():
+def test_as_of_includes_event_at_exact_timestamp():
     db = make_db(("x", 1, T0), ("y", 2, T2))
-    snap = db.at_time(T0)
+    snap = db.as_of(T0)
     assert snap.get("x") == 1
     assert snap.get("y") is ABSENT
 
-def test_at_time_between_events():
+def test_as_of_between_events():
     db = make_db(("x", 1, T0), ("y", 2, T2))
-    snap = db.at_time(T1)
+    snap = db.as_of(T1)
     assert snap.get("x") == 1
     assert snap.get("y") is ABSENT
 
-def test_at_time_before_all_events():
+def test_as_of_before_all_events():
     db = make_db(("x", 1, T1), ("y", 2, T2))
-    snap = db.at_time(T0)
-    assert snap.seq() == 0
+    snap = db.as_of(T0)
+    assert snap.seq == 0
     assert snap.get("x") is ABSENT
 
-def test_at_time_after_all_events():
+def test_as_of_after_all_events():
     db = make_db(("x", 1, T0), ("y", 2, T1))
-    snap = db.at_time(T4)
+    snap = db.as_of(T4)
     assert dict(snap.items()) == {"x": 1, "y": 2}
 
-def test_at_time_empty_db():
+def test_as_of_empty_db():
     db = TimeDB.in_memory()
-    snap = db.at_time(T0)
-    assert snap.seq() == 0
+    snap = db.as_of(T0)
+    assert snap.seq == 0
     assert list(snap.items()) == []
 
-def test_at_time_multiple_events_same_timestamp_all_included():
+def test_as_of_multiple_events_same_timestamp_all_included():
     db = make_db(("x", 1, T0), ("y", 2, T0), ("z", 3, T0))
-    assert dict(db.at_time(T0).items()) == {"x": 1, "y": 2, "z": 3}
+    assert dict(db.as_of(T0).items()) == {"x": 1, "y": 2, "z": 3}
 
-def test_at_time_includes_deletes():
+def test_as_of_includes_deletes():
     db = make_db(("x", 1, T0))
     db.put("x", ABSENT, T1)
-    assert db.at_time(T0).get("x") == 1
-    assert db.at_time(T1).get("x") is ABSENT
+    assert db.as_of(T0).get("x") == 1
+    assert db.as_of(T1).get("x") is ABSENT
 
-def test_at_time_after_reopen(tmp_path):
+def test_as_of_after_reopen(tmp_path):
     path = tmp_path / "db"
     with TimeDB.open(path) as db:
         for i in range(30):
             db.put(f"k{i}", i, T0 + timedelta(seconds=i))
 
     with TimeDB.open(path) as loaded:
-        snap = loaded.at_time(T0 + timedelta(seconds=15))
+        snap = loaded.as_of(T0 + timedelta(seconds=15))
         assert snap.get("k15") == 15
         assert snap.get("k16") is ABSENT
 

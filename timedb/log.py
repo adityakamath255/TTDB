@@ -1,6 +1,6 @@
 from bisect import bisect_right
 from itertools import accumulate
-from typing import Optional, Iterator
+from typing import Optional, Iterable, Iterator, Sequence
 from pathlib import Path
 from datetime import datetime
 
@@ -11,37 +11,29 @@ from .types import Event, OptValue, EMPTY, fold_event
 
 
 class Log:
-    def __init__(
-        self, events: list[Event], log_path: Optional[Path], strict_time: bool,
-    ):
+    def __init__(self, events: Iterable[Event], strict_time: bool):
         self._events = list(events)
         self._roots = list(accumulate(self._events, fold_event, initial=EMPTY))
-        self._log_path = log_path
         self._strict_time = strict_time
-        self._persisted_count = len(self._events)
 
     @classmethod
     def in_memory(cls, strict_time: bool) -> "Log":
-        return cls([], None, strict_time)
+        return cls([], strict_time)
 
     @classmethod
-    def open(cls, log_path: Path, strict_time: bool) -> "Log":
-        return cls(journal.read_and_recover(log_path), log_path, strict_time)
+    def open(cls, log_path: Path, strict_time: bool) -> "DurableLog":
+        return DurableLog(
+            journal.read_and_recover(log_path), strict_time, log_path
+        )
 
-    @classmethod
-    def open_readonly(cls, log_path: Path) -> "Log":
-        return cls(journal.read(log_path), None, False)
-
-    def append(self, key: str, value: OptValue, at: datetime) -> int:
-        return self._publish(key, value, at, None)
-
-    def append_tx(
-        self, writes: dict[str, OptValue], at: datetime
+    def append(
+        self, writes: dict[str, OptValue], at: datetime, tx: bool
     ) -> tuple[int, int]:
-        tx_id = len(self._events)
+        first_seq = len(self._events)
+        tx_id = len(self._events) if tx else None
         for key, value in writes.items():
             self._publish(key, value, at, tx_id)
-        return (tx_id, len(self._events))
+        return (first_seq, len(self._events))
 
     def _publish(
         self, 
@@ -49,7 +41,7 @@ class Log:
         value: OptValue, 
         at: datetime, 
         tx_id: Optional[int]
-    ) -> int:
+    ):
         if (
             self._strict_time 
             and self._events 
@@ -65,20 +57,12 @@ class Log:
         )
         self._events.append(event)
         self._roots.append(fold_event(self._roots[-1], event))
-        return len(self._events) - 1
 
-    def count(self) -> int:
-        return len(self._events)
+    def events(self) -> Sequence[Event]:
+        return self._events
 
-    def state_at(self, seq: int) -> immutables.Map:
-        return self._roots[seq]
-
-    def event_at(self, seq: int) -> Event:
-        return self._events[seq]
-
-    def events_between(self, lo: int, hi: int) -> Iterator[Event]:
-        for i in range(lo, hi):
-            yield self._events[i]
+    def states(self) -> Sequence[immutables.Map]:
+        return self._roots
 
     def seq_as_of(self, t: datetime) -> int:
         if self._events and t >= self._events[0].timestamp:
@@ -88,15 +72,25 @@ class Log:
 
     def tx_exists(self, tx_id: int) -> bool:
         return (
-            0 <= tx_id < self.count()
-            and self.event_at(tx_id).tx_id == tx_id
+            0 <= tx_id < len(self._events)
+            and self._events[tx_id].tx_id == tx_id
         )
 
     def tx_events(self, tx_id: int) -> Iterator[Event]:
-        for e in self.events_between(tx_id, self.count()):
+        for i in range(tx_id, len(self._events)):
+            e = self._events[i]
             if e.tx_id != tx_id:
                 return
             yield e
+
+
+class DurableLog(Log):
+    def __init__(
+        self, events: Iterable[Event], strict_time: bool, log_path: Path
+    ):
+        super().__init__(events, strict_time)
+        self._log_path = log_path
+        self._persisted_count = len(self._events)
 
     def save(self):
         if (

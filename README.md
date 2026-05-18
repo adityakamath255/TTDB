@@ -1,6 +1,6 @@
 # TimeDB
 
-An append-only key-value store for Python that retains full history. Every write is recorded as an immutable event. Past states are queryable by sequence number. Nothing is ever overwritten.
+An append-only key-value store for Python that retains full history. Every write is recorded as an immutable event. Past states are queryable by sequence number or timestamp. Nothing is ever overwritten.
 
 ---
 
@@ -10,10 +10,18 @@ All writes go into a log as `Event` objects with a sequence number, key, value, 
 
 The log is queried through two view types:
 
-- `Snapshot` — the value-view at a single seq. `get`, `keys`, `items`, `diff`. Lookups go through a persistent HAMT root, so creating a snapshot is cheap regardless of log size.
+- `Snapshot` — the value-view at a single seq. `get`, `keys`, `items`, `diff`. Lookups go through a persistent HAMT root, so creating a snapshot is cheap regardless of log size. Snapshots are frozen values: `seq`, `state`, and `timestamp` are attributes.
 - `Interval` — the event-view across a seq window. `history`, `keys_touched`, `tx_ids`, `count`, and iteration over events. Holds bounds plus a log reference; creating one is cheap.
 
 The split mirrors the question being asked: "what is the world at this moment?" goes through Snapshot; "what happened in this window?" goes through Interval.
+
+The database itself comes in three flavors arranged as a capability ladder:
+
+- `TimeDB` — read-only. Returned by `TimeDB.open_readonly(path)`. No writes, no persistence side effects.
+- `WritableTimeDB` — adds in-memory writes. Returned by `TimeDB.in_memory()`.
+- `DurableTimeDB` — adds journal persistence and a process-wide write lock. Returned by `TimeDB.open(path)`.
+
+Type checkers enforce the ladder. Calling `.put()` on a `TimeDB.open_readonly` handle is a type error, not a runtime error, because the method doesn't exist on the read-only class.
 
 ---
 
@@ -42,23 +50,22 @@ print(snap.get("user.name"))  # "bob"
 ### Persistent
 
 ```python
-with TimeDB.open(path, save_events=1000, save_seconds=5.0,
-                 segment_bytes=64 * 1024 * 1024,
-                 fsync_mode="seal") as db:
+with TimeDB.open(path) as db:
     db.put("user.name", "alice")
 ```
 
-A background thread writes events to segment files in `path/`. Writes are durable up to `save_events` events / `save_seconds` seconds behind. Call `db.flush()` to block until persisted.
+`path` is the journal file itself, not a directory. Writes accumulate in memory; `db.save()` appends new events to the journal with fsync. Context-manager exit calls `save` automatically. Crash before save loses the unsaved tail; recovery on next open scans for the last complete JSON line and truncates any partial trailing bytes.
 
-`fsync_mode` controls power-loss durability:
+Opening also acquires an exclusive `flock` on the journal file itself. A second process trying to open the same path raises `RuntimeError`. The lock is released on context-manager exit, or by the kernel if the process crashes.
 
-- `"none"` — no fsync. Writes go to the OS page cache only.
-- `"seal"` — fsync sealed segment files (and the manifest when sealing happens). The active segment may be lost on power loss, but everything before the most recent seal is durable.
-- `"save"` — fsync every write. After `db.flush()` returns, all events are power-loss durable.
+### Read-only
 
-Opening a database also acquires an exclusive flock on `path/LOCK`. A second process trying to open the same path raises `RuntimeError`. The lock is released on context-manager exit, or by the kernel if the process crashes.
+```python
+ro = TimeDB.open_readonly(path)
+print(ro.latest().get("user.name"))
+```
 
-If a previous writer crashed mid-save, leftover `*.tmp` files from in-flight atomic writes are swept on the next open. Committed files are never overwritten, so the manifest still references intact data.
+Returns a `TimeDB` (the read-only base class). No lock acquired, no writes available. Multiple read-only handles can coexist.
 
 ### Time travel
 
@@ -72,11 +79,11 @@ A Snapshot's seq is a *position* in the log: `at(0)` is the empty state before a
 You can also travel by timestamp:
 
 ```python
-snap = db.at_time(some_datetime)
+snap = db.as_of(some_datetime)
 print(snap.get("user.name"))
 ```
 
-at_time(t) returns the snapshot reflecting every event with timestamp ≤ t. Lookup is O(log n) via binary search, which assumes timestamps are written in non-decreasing order. Out-of-order writes still succeed, but at_time results are then undefined. Use at(seq) if you need correctness without that constraint.
+`as_of(t)` returns the snapshot reflecting every event with timestamp ≤ t. Lookup is O(log n) via binary search, which assumes timestamps are written in non-decreasing order. Out-of-order writes still succeed (use `strict_time=True` at open to reject them), but `as_of` results are then undefined. Use `at(seq)` if you need correctness without that constraint.
 
 ### Deletion
 
@@ -84,6 +91,8 @@ at_time(t) returns the snapshot reflecting every event with timestamp ≤ t. Loo
 db.delete("user.name")
 print(db.latest().get("user.name"))  # ABSENT
 ```
+
+`delete(key, at=None)` is shorthand for `put(key, ABSENT, at)`.
 
 ### Atomic writes
 
@@ -94,7 +103,7 @@ start, end = db.apply({
 })
 ```
 
-All keys in a single `apply` call share the same transaction ID and timestamp. The return value is the half-open seq range `[start, end)` covering the events written, so `db.between(start, end)` gives you back this transaction. `apply` raises `ValueError` on an empty dict.
+All keys in a single `apply` call share the same transaction ID and timestamp. The return value is the half-open seq range `[start, end)` covering the events written, so `db.between(start, end)` gives you back this transaction. An empty dict is a no-op and returns `(count, count)`.
 
 ### Diffing snapshots
 
@@ -149,8 +158,8 @@ Single-key writes via `put` and `delete` have `tx_id = None`.
 
 ## Values
 
-Accepted value types are `str`, `int`, `float`, `bool`, `None`, and arbitrarily nested `list` and `dict` combinations with string keys. Any other type raises `TypeError` at write time.
+Accepted value types are `str`, `int`, `float`, `bool`, `None`, and arbitrarily nested `list` and `dict` combinations with string keys. The recursive type alias `OptValue` in `timedb.types` encodes this exactly. Validation happens at type-check time, not runtime — pass anything other than an `OptValue` and pyright or mypy will reject the call.
 
-The constraint comes from the on-disk log being JSONL: it should stay readable from any language. Validation runs at write time, not save time, so the error lands close to the mistake.
+The constraint comes from the on-disk log being JSONL: it should stay readable from any language.
 
 ---

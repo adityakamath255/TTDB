@@ -1,35 +1,37 @@
-from typing import Optional, Any, Iterator
+from typing import Optional, Iterator
 from datetime import datetime
 
-from .types import ABSENT
+from .types import OptValue, ABSENT
 from .log import Log
 
 
 class Snapshot:
-    def __init__(self, log: Log, through: int):
-        self._log = log
-        self._seq = through
-        self._state = log.state_at(through)
+    def __init__(self, log: Log, seq: int):
+        self._seq = seq
+        self._state = log.state_at(seq)
+        if seq == 0:
+            self._timestamp = None
+        else:
+            self._timestamp = log.event_at(seq - 1).timestamp
 
     def seq(self) -> int:
         return self._seq
 
-    def get(self, key: str) -> Any:
-        return self._state.get(key, ABSENT)
-
     def timestamp(self) -> Optional[datetime]:
-        if self._seq == 0:
-            return None
-        else:
-            return self._log.event_at(self._seq - 1).timestamp
+        return self._timestamp
+
+    def get(self, key: str) -> OptValue:
+        return self._state.get(key, ABSENT)
 
     def keys(self) -> Iterator[str]:
         return iter(self._state)
 
-    def items(self) -> Iterator[tuple[str, Any]]:
+    def items(self) -> Iterator[tuple[str, OptValue]]:
         return iter(self._state.items())
 
-    def diff(self, other: "Snapshot") -> Iterator[tuple[str, Any, Any]]:
+    def diff(
+        self, other: "Snapshot"
+    ) -> Iterator[tuple[str, OptValue, OptValue]]:
         a, b = self._state, other._state
         for k in set(a) | set(b):
             a_val = a.get(k, ABSENT)

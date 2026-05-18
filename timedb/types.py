@@ -1,60 +1,35 @@
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, Optional
+from typing import Optional
 
 import immutables
 
 
-class _Absent:
+class Absent:
     def __repr__(self) -> str:
         return "ABSENT"
 
 
-ABSENT = _Absent()
+ABSENT = Absent()
 EMPTY: immutables.Map = immutables.Map()
+
+Value = str | int | float | bool | None | list["Value"] | dict[str, "Value"]
+OptValue = Value | Absent
 
 
 @dataclass(frozen=True, slots=True)
 class Event:
     seq: int
     key: str
-    value: Any
+    value: OptValue
     timestamp: datetime
     tx_id: Optional[int]
 
 
-def apply(root: immutables.Map, event: "Event") -> immutables.Map:
+def fold_event(root: immutables.Map, event: Event) -> immutables.Map:
     if event.value is not ABSENT:
         return root.set(event.key, event.value)
-    if event.key in root:
+    elif event.key in root:
         return root.delete(event.key)
-    return root
-
-
-def _validate_json(value: Any):
-    if isinstance(value, (str, int, float, bool)) or value is None:
-        pass
-
-    elif isinstance(value, list):
-        for item in value:
-            _validate_json(item)
-
-    elif isinstance(value, dict):
-        for k, v in value.items():
-            if not isinstance(k, str):
-                raise TypeError(
-                    f"dict keys must be strings, "
-                    f"got {type(k).__name__}"
-                )
-            _validate_json(v)
-
     else:
-        raise TypeError(
-            f"value of type {type(value).__name__} "
-            f"is not JSON-serializable"
-        )
-
-
-def validate_value(value: Any):
-    if value is not ABSENT:
-        _validate_json(value)
+        return root

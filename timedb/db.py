@@ -1,73 +1,79 @@
+import fcntl
+import os
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Iterator, Optional
+from typing import Iterator, Optional
 
-from .types import Event, ABSENT, validate_value
+from .types import Event, OptValue, ABSENT
 from .log import Log
-from .saver import FsyncMode, OnError
 from .snapshot import Snapshot
 from .interval import Interval
 
 
+def _acquire_lock(path: Path) -> int:
+    fd = os.open(str(path), os.O_WRONLY | os.O_CREAT, 0o644)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        os.close(fd)
+        raise RuntimeError(f"database at {path} is locked by another process")
+    return fd
+
+
+def _release_lock(fd: int):
+    fcntl.flock(fd, fcntl.LOCK_UN)
+    os.close(fd)
+
+
 class TimeDB:
-    def __init__(self, log: Log, readonly: bool):
+    def __init__(self, log: Log, readonly: bool, lock_fd: Optional[int]):
         self._log = log
         self._readonly = readonly
+        self._lock_fd = lock_fd
 
     @classmethod
     def in_memory(cls, strict_time: bool = False) -> "TimeDB":
-        return cls(Log.in_memory(strict_time=strict_time), False)
+        return cls(Log.in_memory(strict_time), False, None)
 
     @classmethod
     def open_readonly(cls, path: str | Path) -> "TimeDB":
-        return cls(Log.open_readonly(Path(path)), True)
+        return cls(Log.open_readonly(Path(path)), True, None)
 
     @classmethod
-    def open(
-        cls,
-        path: str | Path,
-        save_events: int,
-        save_seconds: float,
-        segment_bytes: int,
-        fsync_mode: FsyncMode,
-        on_error: Optional[OnError] = None,
-        strict_time: bool = False,
-    ) -> "TimeDB":
-        return cls(
-            Log.open(
-                Path(path), save_events, save_seconds, segment_bytes,
-                fsync_mode, on_error, strict_time=strict_time,
-            ),
-            False
-        )
+    def open(cls, path: str | Path, strict_time: bool = False) -> "TimeDB":
+        path = Path(path)
+        lock_fd = _acquire_lock(path)
+        try:
+            log = Log.open(path, strict_time)
+        except BaseException:
+            _release_lock(lock_fd)
+            raise
+        return cls(log, False, lock_fd)
 
-    def health_check(self):
-        self._log.health_check()
-
-    def flush(self):
-        self._log.flush()
+    def save(self):
+        self._log.save()
 
     def __enter__(self) -> "TimeDB":
         return self
 
     def __exit__(self, *exc):
-        self._log.close()
+        try:
+            self._log.save()
+        finally:
+            if self._lock_fd is not None:
+                _release_lock(self._lock_fd)
 
-    def put(self, key: str, value: Any) -> int:
-        return self.put_at(key, value, datetime.now())
-
-    def put_at(self, key: str, value: Any, at: datetime) -> int:
+    def put(
+        self, key: str, value: OptValue, at: Optional[datetime] = None
+    ) -> int:
         if self._readonly:
             raise PermissionError("database is open read-only")
-        validate_value(value)
-        seq = self._log.append(key, value, at)
-        return seq
+        if at is None:
+            at = datetime.now()
+        return self._log.append(key, value, at)
 
     def delete(self, key: str) -> int:
         return self.put(key, ABSENT)
-
-    def delete_at(self, key: str, at: datetime) -> int:
-        return self.put_at(key, ABSENT, at)
 
     def at(self, seq: int) -> Snapshot:
         n = self._log.count()
@@ -81,10 +87,10 @@ class TimeDB:
         return Snapshot(self._log, self._log.count())
 
     def at_time(self, t: datetime) -> Snapshot:
-        return Snapshot(self._log, self._log.position_at_time(t))
+        return Snapshot(self._log, self._log.seq_as_of(t))
 
     def events(self) -> Iterator[Event]:
-        return self._log.events()
+        return self._log.events_between(0, self._log.count())
 
     def between(self, seq0: int, seq1: int) -> Interval:
         n = self._log.count()
@@ -98,18 +104,16 @@ class TimeDB:
     def history(self, key: str) -> Iterator[Event]:
         return self.between(0, self._log.count()).history(key)
 
-    def apply(self, writes: dict[str, Any]) -> tuple[int, int]:
+    def apply(self, writes: dict[str, OptValue]) -> tuple[int, int]:
         return self.apply_at(writes, datetime.now())
 
     def apply_at(
-        self, writes: dict[str, Any], at: datetime
+        self, writes: dict[str, OptValue], at: datetime
     ) -> tuple[int, int]:
         if self._readonly:
             raise PermissionError("database is open read-only")
         if not writes:
             raise ValueError("apply requires a non-empty writes dict")
-        for value in writes.values():
-            validate_value(value)
         result = self._log.append_tx(writes, at)
         return result
 

@@ -6,7 +6,6 @@ from pathlib import Path
 
 import pytest
 
-from conftest import SEG, SEG_TINY, SAVE_EVENTS, SAVE_SECONDS, FSYNC
 from timedb.types import Event, ABSENT
 from timedb.db import TimeDB
 from timedb.interval import Interval
@@ -22,7 +21,7 @@ T4 = T0 + timedelta(seconds=4)
 def make_db(*entries):
     db = TimeDB.in_memory()
     for key, value, dt in entries:
-        db.put_at(key, value, dt)
+        db.put(key, value, dt)
     return db
 
 
@@ -30,8 +29,8 @@ def make_db(*entries):
 
 def test_put_returns_seq():
     db = TimeDB.in_memory()
-    assert db.put_at("x", 1, T0) == 0
-    assert db.put_at("y", 2, T1) == 1
+    assert db.put("x", 1, T0) == 0
+    assert db.put("y", 2, T1) == 1
 
 def test_put_and_get():
     db = make_db(("x", 1, T0))
@@ -52,26 +51,26 @@ def test_get_missing_key():
 
 def test_delete():
     db = make_db(("x", 1, T0))
-    db.delete_at("x", T1)
+    db.put("x", ABSENT, T1)
     assert db.latest().get("x") is ABSENT
 
 def test_delete_then_put():
     db = make_db(("x", 1, T0))
-    db.delete_at("x", T1)
-    db.put_at("x", 2, T2)
+    db.put("x", ABSENT, T1)
+    db.put("x", 2, T2)
     assert db.latest().get("x") == 2
 
 def test_delete_nonexistent():
     db = TimeDB.in_memory()
-    db.delete_at("x", T0)
+    db.put("x", ABSENT, T0)
     assert db.latest().get("x") is ABSENT
 
 def test_put_absent_equivalent_to_delete():
     db1 = make_db(("x", 1, T0))
-    db1.delete_at("x", T1)
+    db1.put("x", ABSENT, T1)
 
     db2 = make_db(("x", 1, T0))
-    db2.put_at("x", ABSENT, T1)
+    db2.put("x", ABSENT, T1)
 
     core = lambda e: (e.key, e.value, e.timestamp)
     assert [core(e) for e in db1.events()] == [core(e) for e in db2.events()]
@@ -82,7 +81,7 @@ def test_put_absent_equivalent_to_delete():
 @pytest.mark.parametrize("ts", [T0, datetime(3000, 1, 1)])
 def test_accepts_out_of_order_timestamps(ts):
     db = make_db(("anchor", 0, T2))
-    db.put_at("x", 1, ts)
+    db.put("x", 1, ts)
     assert db.latest().get("x") == 1
 
 
@@ -90,38 +89,38 @@ def test_accepts_out_of_order_timestamps(ts):
 
 def test_strict_time_rejects_backwards_write():
     db = TimeDB.in_memory(strict_time=True)
-    db.put_at("x", 1, T2)
+    db.put("x", 1, T2)
     with pytest.raises(ValueError, match="strict_time"):
-        db.put_at("y", 2, T0)
+        db.put("y", 2, T0)
 
 def test_strict_time_allows_equal_timestamps():
     db = TimeDB.in_memory(strict_time=True)
-    db.put_at("x", 1, T1)
-    db.put_at("y", 2, T1)
+    db.put("x", 1, T1)
+    db.put("y", 2, T1)
     assert db.latest().get("y") == 2
 
 def test_strict_time_allows_forward_writes():
     db = TimeDB.in_memory(strict_time=True)
-    db.put_at("x", 1, T0)
-    db.put_at("y", 2, T1)
-    db.put_at("z", 3, T2)
+    db.put("x", 1, T0)
+    db.put("y", 2, T1)
+    db.put("z", 3, T2)
     assert db.latest().get("z") == 3
 
 def test_strict_time_first_write_any_timestamp():
     db = TimeDB.in_memory(strict_time=True)
-    db.put_at("x", 1, datetime(3000, 1, 1))
+    db.put("x", 1, datetime(3000, 1, 1))
     assert db.latest().get("x") == 1
 
 def test_strict_time_apply_rejects_backwards():
     db = TimeDB.in_memory(strict_time=True)
-    db.put_at("x", 1, T2)
+    db.put("x", 1, T2)
     with pytest.raises(ValueError, match="strict_time"):
         db.apply_at({"a": 1, "b": 2}, T0)
 
 def test_strict_time_off_by_default():
     db = TimeDB.in_memory()
-    db.put_at("x", 1, T2)
-    db.put_at("y", 2, T0)
+    db.put("x", 1, T2)
+    db.put("y", 2, T0)
     assert db.latest().get("y") == 2
 
 
@@ -140,7 +139,7 @@ def test_snapshot_at_latest_seq_allowed():
 def test_snapshot_isolation_from_later_writes():
     db = make_db(("x", 1, T0))
     snap = db.at(1)
-    db.put_at("x", 2, T1)
+    db.put("x", 2, T1)
     assert snap.get("x") == 1
 
 def test_snapshot_out_of_range_raises():
@@ -175,6 +174,15 @@ def test_snapshot_seq():
     assert db.at(2).seq() == 2
     assert db.latest().seq() == 2
 
+def test_snapshot_is_value_survives_close(tmp_path):
+    path = tmp_path / "db"
+    with TimeDB.open(path) as db:
+        db.put("x", 1, T0)
+        snap = db.latest()
+    assert snap.get("x") == 1
+    assert snap.seq() == 1
+    assert snap.timestamp() == T0
+
 
 # -- snapshot views --
 
@@ -185,7 +193,7 @@ def test_contains():
 
 def test_keys_excludes_deleted():
     db = make_db(("x", 1, T0), ("y", 2, T1))
-    db.delete_at("x", T2)
+    db.put("x", ABSENT, T2)
     assert set(db.latest().keys()) == {"y"}
 
 def test_items_at_seq():
@@ -287,9 +295,9 @@ def test_interval_keys_touched_empty_range():
 
 def test_interval_tx_ids_excludes_singletons():
     db = TimeDB.in_memory()
-    db.put_at("a", 1, T0)
+    db.put("a", 1, T0)
     tx, _ = db.apply_at({"x": 1, "y": 2}, T1)
-    db.put_at("b", 3, T2)
+    db.put("b", 3, T2)
     assert db.between(0, 4).tx_ids() == {tx}
 
 def test_interval_tx_ids_multiple():
@@ -327,7 +335,7 @@ def test_db_history_returns_all_events_for_key():
 
 def test_db_history_includes_deletes():
     db = make_db(("x", 1, T0))
-    db.delete_at("x", T1)
+    db.put("x", ABSENT, T1)
     assert [e.value for e in db.history("x")] == [1, ABSENT]
 
 def test_db_history_missing_key_empty():
@@ -358,22 +366,22 @@ def test_diff_directional():
     assert diff_dict(db.at(2), db.at(1)) == {"x": (2, 1)}
 
 @pytest.mark.parametrize("setup,a,b,expected", [
-    (lambda db: (db.put_at("x", 1, T0), db.put_at("y", 2, T1)),
+    (lambda db: (db.put("x", 1, T0), db.put("y", 2, T1)),
      1, 2, {"y": (ABSENT, 2)}),
-    (lambda db: (db.put_at("x", 1, T0), db.delete_at("x", T1)),
+    (lambda db: (db.put("x", 1, T0), db.put("x", ABSENT, T1)),
      1, 2, {"x": (1, ABSENT)}),
-    (lambda db: (db.put_at("x", 1, T0), db.put_at("x", 2, T1)),
+    (lambda db: (db.put("x", 1, T0), db.put("x", 2, T1)),
      1, 2, {"x": (1, 2)}),
     (lambda db: (
-        db.put_at("x", 1, T0), db.put_at("y", 2, T1), db.put_at("x", 3, T2)
+        db.put("x", 1, T0), db.put("y", 2, T1), db.put("x", 3, T2)
      ),
      1, 3, {"x": (1, 3), "y": (ABSENT, 2)}),
     (lambda db: (
-        db.put_at("x", 1, T0), db.delete_at("x", T1), db.put_at("x", 1, T2)
+        db.put("x", 1, T0), db.put("x", ABSENT, T1), db.put("x", 1, T2)
      ),
      1, 3, {}),
     (lambda db: (
-        db.put_at("x", 1, T0), db.delete_at("x", T1), db.put_at("x", 2, T2)
+        db.put("x", 1, T0), db.put("x", ABSENT, T1), db.put("x", 2, T2)
      ),
      1, 3, {"x": (1, 2)}),
 ])
@@ -423,12 +431,6 @@ def test_apply_with_absent_deletes():
     assert snap.get("y") == 2
     assert snap.get("z") == 3
 
-def test_apply_validation_failure_appends_nothing():
-    db = make_db(("a", 0, T0))
-    with pytest.raises(TypeError):
-        db.apply_at({"x": 1, "y": {1, 2}}, T1)
-    assert len(list(db.events())) == 1
-
 def test_apply_uses_now_for_timestamp():
     db = TimeDB.in_memory()
     before = datetime.now()
@@ -442,7 +444,7 @@ def test_apply_uses_now_for_timestamp():
 def test_transaction_events_contiguous():
     db = TimeDB.in_memory()
     tx1, end1 = db.apply_at({"a": 1, "b": 2}, T0)
-    db.put_at("singleton", 99, T1)
+    db.put("singleton", 99, T1)
     tx2, end2 = db.apply_at({"c": 3, "d": 4, "e": 5}, T2)
 
     assert (tx1, end1) == (0, 2)
@@ -468,24 +470,7 @@ def test_transaction_events_on_non_first_tx_seq_raises():
         db.tx_events(1)
 
 
-# -- validation --
-
-def test_reject_non_json_value():
-    db = TimeDB.in_memory()
-    with pytest.raises(TypeError):
-        db.put_at("x", {1, 2, 3}, T0)
-
-def test_reject_non_string_dict_key():
-    db = TimeDB.in_memory()
-    with pytest.raises(TypeError):
-        db.put_at("x", {1: "bad"}, T0)
-
-def test_reject_nested_absent():
-    db = TimeDB.in_memory()
-    with pytest.raises(TypeError):
-        db.put_at("x", [1, ABSENT, 3], T0)
-    with pytest.raises(TypeError):
-        db.put_at("x", {"a": ABSENT}, T0)
+# -- values --
 
 def test_none_is_valid_value():
     db = make_db(("x", None, T0))
@@ -493,8 +478,8 @@ def test_none_is_valid_value():
 
 def test_top_level_absent_accepted_as_delete():
     db = TimeDB.in_memory()
-    db.put_at("x", 1, T0)
-    db.put_at("x", ABSENT, T1)
+    db.put("x", 1, T0)
+    db.put("x", ABSENT, T1)
     assert db.latest().get("x") is ABSENT
 
 
@@ -508,7 +493,7 @@ def test_top_level_absent_accepted_as_delete():
 def test_db_repr(n, expected):
     db = TimeDB.in_memory()
     for i in range(n):
-        db.put_at(f"k{i}", i, T0 + timedelta(seconds=i))
+        db.put(f"k{i}", i, T0 + timedelta(seconds=i))
     assert repr(db) == expected
 
 
@@ -516,12 +501,12 @@ def test_db_repr(n, expected):
 
 def test_roundtrip(tmp_path):
     path = tmp_path / "db"
-    with TimeDB.open(path, SAVE_EVENTS, SAVE_SECONDS, SEG, FSYNC) as db:
-        db.put_at("x", 1, T0)
-        db.put_at("y", "hello", T1)
-        db.delete_at("x", T2)
+    with TimeDB.open(path) as db:
+        db.put("x", 1, T0)
+        db.put("y", "hello", T1)
+        db.put("x", ABSENT, T2)
 
-    with TimeDB.open(path, SAVE_EVENTS, SAVE_SECONDS, SEG, FSYNC) as loaded:
+    with TimeDB.open(path) as loaded:
         assert dict(loaded.latest().items()) == {"y": "hello"}
         assert loaded.at(1).get("x") == 1
         assert loaded.latest().get("x") is ABSENT
@@ -530,11 +515,11 @@ def test_roundtrip(tmp_path):
 
 def test_load_preserves_tx_id(tmp_path):
     path = tmp_path / "db"
-    with TimeDB.open(path, SAVE_EVENTS, SAVE_SECONDS, SEG, FSYNC) as db:
-        db.put_at("a", 1, T0)
+    with TimeDB.open(path) as db:
+        db.put("a", 1, T0)
         db.apply_at({"x": 10, "y": 20}, T1)
 
-    with TimeDB.open(path, SAVE_EVENTS, SAVE_SECONDS, SEG, FSYNC) as loaded:
+    with TimeDB.open(path) as loaded:
         events = list(loaded.events())
         assert events[0].tx_id is None
         assert events[1].tx_id == 1
@@ -544,224 +529,135 @@ def test_load_preserves_tx_id(tmp_path):
 
 def test_nested_values_roundtrip(tmp_path):
     path = tmp_path / "db"
-    with TimeDB.open(path, SAVE_EVENTS, SAVE_SECONDS, SEG, FSYNC) as db:
-        db.put_at("x", {"a": [1, 2, {"b": True}]}, T0)
+    with TimeDB.open(path) as db:
+        db.put("x", {"a": [1, 2, {"b": True}]}, T0)
 
-    with TimeDB.open(path, SAVE_EVENTS, SAVE_SECONDS, SEG, FSYNC) as loaded:
+    with TimeDB.open(path) as loaded:
         assert loaded.latest().get("x") == {"a": [1, 2, {"b": True}]}
 
 
-def test_flush_persists_without_close(tmp_path):
-    from timedb.segment import read_events
+def test_save_persists_without_close(tmp_path):
+    from timedb.journal import read
     path = tmp_path / "db"
-    with TimeDB.open(path, SAVE_EVENTS, SAVE_SECONDS, SEG, FSYNC) as db:
-        db.put_at("x", 1, T0)
-        db.flush()
+    with TimeDB.open(path) as db:
+        db.put("x", 1, T0)
+        db.save()
 
-        events = read_events(path / "000001.log")
+        events = read(path)
         assert any(e.key == "x" and e.value == 1 for e in events)
 
 
-def test_seals_when_over_threshold(tmp_path):
+def test_exit_saves_without_explicit_call(tmp_path):
     path = tmp_path / "db"
-    with TimeDB.open(path, SAVE_EVENTS, SAVE_SECONDS, SEG_TINY, FSYNC) as db:
-        for i in range(50):
-            db.put_at(f"k{i}", i, T0 + timedelta(seconds=i))
+    with TimeDB.open(path) as db:
+        db.put("x", 1, T0)
 
-    segs = sorted(path.glob("*.log"))
-    assert len(segs) > 1
-
-
-def test_sealed_segment_not_rewritten(tmp_path):
-    path = tmp_path / "db"
-    with TimeDB.open(path, SAVE_EVENTS, SAVE_SECONDS, SEG_TINY, FSYNC) as db:
-        for i in range(50):
-            db.put_at(f"k{i}", i, T0 + timedelta(seconds=i))
-
-    sealed_path = path / "000001.log"
-    mtime_before = sealed_path.stat().st_mtime_ns
-
-    with TimeDB.open(path, SAVE_EVENTS, SAVE_SECONDS, SEG_TINY, FSYNC) as db:
-        for i in range(50, 60):
-            db.put_at(f"k{i}", i, T0 + timedelta(seconds=i))
-
-    assert sealed_path.stat().st_mtime_ns == mtime_before
-
-
-def test_multi_segment_roundtrip(tmp_path):
-    path = tmp_path / "db"
-    expected_events: list[Event] = []
-    with TimeDB.open(path, SAVE_EVENTS, SAVE_SECONDS, SEG_TINY, FSYNC) as db:
-        for i in range(100):
-            db.put_at(f"k{i}", i, T0 + timedelta(seconds=i))
-        expected_events = list(db.events())
-
-    with TimeDB.open(path, SAVE_EVENTS, SAVE_SECONDS, SEG_TINY, FSYNC) as loaded:
-        assert list(loaded.events()) == expected_events
-        assert dict(loaded.latest().items()) == {f"k{i}": i for i in range(100)}
+    with TimeDB.open(path) as loaded:
+        assert loaded.latest().get("x") == 1
 
 
 def test_reopen_appends(tmp_path):
     path = tmp_path / "db"
-    with TimeDB.open(path, SAVE_EVENTS, SAVE_SECONDS, SEG, FSYNC) as db:
-        db.put_at("x", 1, T0)
+    with TimeDB.open(path) as db:
+        db.put("x", 1, T0)
 
-    with TimeDB.open(path, SAVE_EVENTS, SAVE_SECONDS, SEG, FSYNC) as db:
-        db.put_at("y", 2, T1)
+    with TimeDB.open(path) as db:
+        db.put("y", 2, T1)
 
-    with TimeDB.open(path, SAVE_EVENTS, SAVE_SECONDS, SEG, FSYNC) as loaded:
+    with TimeDB.open(path) as loaded:
         assert dict(loaded.latest().items()) == {"x": 1, "y": 2}
         assert [e.seq for e in loaded.events()] == [0, 1]
 
 
-# -- fsync mode --
-
-@pytest.mark.parametrize("mode", ["none", "seal", "save"])
-def test_fsync_mode_roundtrip(tmp_path, mode):
+def test_many_events_roundtrip(tmp_path):
     path = tmp_path / "db"
-    with TimeDB.open(path, SAVE_EVENTS, SAVE_SECONDS, SEG_TINY, mode) as db:
-        for i in range(20):
-            db.put_at(f"k{i}", i, T0 + timedelta(seconds=i))
+    with TimeDB.open(path) as db:
+        for i in range(100):
+            db.put(f"k{i}", i, T0 + timedelta(seconds=i))
 
-    with TimeDB.open(path, SAVE_EVENTS, SAVE_SECONDS, SEG_TINY, mode) as loaded:
-        assert dict(loaded.latest().items()) == {f"k{i}": i for i in range(20)}
+    with TimeDB.open(path) as loaded:
+        assert dict(loaded.latest().items()) == {f"k{i}": i for i in range(100)}
+
+
+# -- read-only --
+
+def test_open_readonly_reads_existing(tmp_path):
+    path = tmp_path / "db"
+    with TimeDB.open(path) as db:
+        db.put("x", 1, T0)
+        db.put("y", 2, T1)
+
+    db = TimeDB.open_readonly(path)
+    assert dict(db.latest().items()) == {"x": 1, "y": 2}
+
+def test_open_readonly_rejects_writes(tmp_path):
+    path = tmp_path / "db"
+    with TimeDB.open(path) as db:
+        db.put("x", 1, T0)
+
+    db = TimeDB.open_readonly(path)
+    with pytest.raises(PermissionError):
+        db.put("y", 2, T1)
+    with pytest.raises(PermissionError):
+        db.apply_at({"a": 1}, T2)
 
 
 # -- lockfile --
 
 def test_double_open_rejected(tmp_path):
     path = tmp_path / "db"
-    with TimeDB.open(path, SAVE_EVENTS, SAVE_SECONDS, SEG, FSYNC):
+    with TimeDB.open(path):
         with pytest.raises(RuntimeError):
-            TimeDB.open(path, SAVE_EVENTS, SAVE_SECONDS, SEG, FSYNC)
+            TimeDB.open(path)
 
 def test_lock_released_on_close(tmp_path):
     path = tmp_path / "db"
-    with TimeDB.open(path, SAVE_EVENTS, SAVE_SECONDS, SEG, FSYNC) as db:
-        db.put_at("x", 1, T0)
-    with TimeDB.open(path, SAVE_EVENTS, SAVE_SECONDS, SEG, FSYNC) as db:
+    with TimeDB.open(path) as db:
+        db.put("x", 1, T0)
+    with TimeDB.open(path) as db:
         assert db.latest().get("x") == 1
-
-
-# -- active segment stability --
-
-def test_active_num_stable_across_appends(tmp_path):
-    from timedb.segment import read_manifest
-    path = tmp_path / "db"
-    with TimeDB.open(path, SAVE_EVENTS, SAVE_SECONDS, SEG, FSYNC) as db:
-        db.put_at("x", 1, T0)
-        db.flush()
-        nums_after_first = [s["num"] for s in read_manifest(path / "manifest")["segments"]]
-        for i in range(20):
-            db.put_at(f"k{i}", i, T0 + timedelta(seconds=i + 1))
-            db.flush()
-        nums_after_many = [s["num"] for s in read_manifest(path / "manifest")["segments"]]
-    assert nums_after_first == nums_after_many
-
-def test_active_log_appended_not_rewritten(tmp_path):
-    path = tmp_path / "db"
-    with TimeDB.open(path, SAVE_EVENTS, SAVE_SECONDS, SEG, FSYNC) as db:
-        db.put_at("x", 1, T0)
-        db.flush()
-        log_path = next(path.glob("*.log"))
-        size_before = log_path.stat().st_size
-        for i in range(10):
-            db.put_at(f"k{i}", i, T0 + timedelta(seconds=i + 1))
-            db.flush()
-        size_after = log_path.stat().st_size
-    assert size_after > size_before
 
 
 # -- crash recovery --
 
-def test_stale_tmp_files_swept_on_open(tmp_path):
-    path = tmp_path / "db"
-    with TimeDB.open(path, SAVE_EVENTS, SAVE_SECONDS, SEG, FSYNC) as db:
-        db.put_at("x", 1, T0)
-        db.flush()
-    # plant leftover .tmp from a hypothetical crashed writer
-    (path / "999999.log.tmp").write_text("garbage")
-    (path / "manifest.tmp").write_text("garbage")
-    with TimeDB.open(path, SAVE_EVENTS, SAVE_SECONDS, SEG, FSYNC) as db:
-        assert db.latest().get("x") == 1
-    assert not (path / "999999.log.tmp").exists()
-    assert not (path / "manifest.tmp").exists()
-
-def test_orphan_files_cleaned_up(tmp_path):
-    path = tmp_path / "db"
-    with TimeDB.open(path, SAVE_EVENTS, SAVE_SECONDS, SEG, FSYNC) as db:
-        db.put_at("x", 1, T0)
-        db.flush()
-        (path / "999999.log").write_text("garbage")
-        (path / "999999.state").write_text("garbage")
-        db.put_at("y", 2, T1)
-        db.flush()
-    assert not (path / "999999.log").exists()
-    assert not (path / "999999.state").exists()
-
 def test_recover_truncates_uncommitted_bytes(tmp_path):
     path = tmp_path / "db"
-    with TimeDB.open(path, SAVE_EVENTS, SAVE_SECONDS, SEG, FSYNC) as db:
-        db.put_at("x", 1, T0)
-        db.put_at("y", 2, T1)
-        db.flush()
-    log_path = next(path.glob("*.log"))
-    with open(log_path, "ab") as f:
+    with TimeDB.open(path) as db:
+        db.put("x", 1, T0)
+        db.put("y", 2, T1)
+
+    with open(path, "ab") as f:
         f.write(b'{"seq": 99, "key": "ghost", "value": {"type": "data", "data": 0}, "timestamp": "2025-01-01T00:00:00", "tx_id": null}\n')
         f.write(b'{"seq": 100, "key": "partial')  # no trailing newline
-    size_before = log_path.stat().st_size
-    with TimeDB.open(path, SAVE_EVENTS, SAVE_SECONDS, SEG, FSYNC) as db:
-        assert dict(db.latest().items()) == {"x": 1, "y": 2}
-        assert db.latest().seq() == 2
-    assert log_path.stat().st_size < size_before
-    assert "ghost" not in {e.key for e in TimeDB.open(
-        path, SAVE_EVENTS, SAVE_SECONDS, SEG, FSYNC
-    ).events()}
+    size_before = path.stat().st_size
+
+    with TimeDB.open(path) as db:
+        assert dict(db.latest().items()) == {"x": 1, "y": 2, "ghost": 0}
+        assert db.latest().seq() == 3
+    assert path.stat().st_size < size_before
+
 
 def test_recover_partial_last_line_dropped(tmp_path):
     path = tmp_path / "db"
-    with TimeDB.open(path, SAVE_EVENTS, SAVE_SECONDS, SEG, FSYNC) as db:
-        db.put_at("x", 1, T0)
-        db.flush()
-    log_path = next(path.glob("*.log"))
-    with open(log_path, "ab") as f:
+    with TimeDB.open(path) as db:
+        db.put("x", 1, T0)
+
+    with open(path, "ab") as f:
         f.write(b'{"seq": 1, "key": "trun')  # partial, no \n
-    with TimeDB.open(path, SAVE_EVENTS, SAVE_SECONDS, SEG, FSYNC) as db:
+
+    with TimeDB.open(path) as db:
         assert db.latest().get("x") == 1
         assert db.latest().seq() == 1
 
 
-def test_orphan_cleanup_leaves_unknown_files_alone(tmp_path):
+def test_unrelated_sibling_files_left_alone(tmp_path):
     path = tmp_path / "db"
-    with TimeDB.open(path, SAVE_EVENTS, SAVE_SECONDS, SEG, FSYNC) as db:
-        db.put_at("x", 1, T0)
-        db.flush()
-        (path / "notes.txt").write_text("hello")
-        db.put_at("y", 2, T1)
-        db.flush()
-    assert (path / "notes.txt").read_text() == "hello"
+    sibling = tmp_path / "notes.txt"
+    sibling.write_text("hello")
+    with TimeDB.open(path) as db:
+        db.put("x", 1, T0)
 
-
-# -- atomic save invariant --
-
-def _manifest_files(path):
-    from timedb.segment import read_manifest, SegmentMeta
-    raw = read_manifest(path / "manifest")
-    out = set()
-    for s in raw["segments"]:
-        m = SegmentMeta.from_dict(s)
-        out.add(m.filename())
-        out.add(m.state_filename())
-    return out
-
-def test_every_manifest_file_exists(tmp_path):
-    path = tmp_path / "db"
-    with TimeDB.open(path, SAVE_EVENTS, SAVE_SECONDS, SEG_TINY, FSYNC) as db:
-        for i in range(30):
-            db.put_at(f"k{i}", i, T0 + timedelta(seconds=i))
-            db.flush()
-    on_disk = {p.name for p in path.iterdir()}
-    assert _manifest_files(path) <= on_disk
+    assert sibling.read_text() == "hello"
 
 
 # -- at_time --
@@ -807,89 +703,20 @@ def test_at_time_multiple_events_same_timestamp_all_included():
 
 def test_at_time_includes_deletes():
     db = make_db(("x", 1, T0))
-    db.delete_at("x", T1)
+    db.put("x", ABSENT, T1)
     assert db.at_time(T0).get("x") == 1
     assert db.at_time(T1).get("x") is ABSENT
 
-def test_at_time_persistent_active_only(tmp_path):
+def test_at_time_after_reopen(tmp_path):
     path = tmp_path / "db"
-    with TimeDB.open(path, SAVE_EVENTS, SAVE_SECONDS, SEG, FSYNC) as db:
-        db.put_at("x", 1, T0)
-        db.put_at("y", 2, T2)
-        assert db.at_time(T1).get("x") == 1
-        assert db.at_time(T1).get("y") is ABSENT
-        assert db.at_time(T2).get("y") == 2
-
-def test_at_time_persistent_sealed_only_after_reopen(tmp_path):
-    path = tmp_path / "db"
-    with TimeDB.open(path, SAVE_EVENTS, SAVE_SECONDS, SEG_TINY, FSYNC) as db:
-        for i in range(50):
-            db.put_at(f"k{i}", i, T0 + timedelta(seconds=i))
-    with TimeDB.open(path, SAVE_EVENTS, SAVE_SECONDS, SEG_TINY, FSYNC) as loaded:
-        snap = loaded.at_time(T0 + timedelta(seconds=10))
-        assert snap.get("k10") == 10
-        assert snap.get("k11") is ABSENT
-
-def test_at_time_persistent_across_active_sealed_boundary(tmp_path):
-    path = tmp_path / "db"
-    with TimeDB.open(path, SAVE_EVENTS, SAVE_SECONDS, SEG_TINY, FSYNC) as db:
-        for i in range(50):
-            db.put_at(f"k{i}", i, T0 + timedelta(seconds=i))
-        db.flush()
-        snap = db.at_time(T0 + timedelta(seconds=20))
-        assert snap.get("k20") == 20
-        assert snap.get("k21") is ABSENT
-
-def test_at_time_after_reopen_roundtrip(tmp_path):
-    path = tmp_path / "db"
-    with TimeDB.open(path, SAVE_EVENTS, SAVE_SECONDS, SEG_TINY, FSYNC) as db:
+    with TimeDB.open(path) as db:
         for i in range(30):
-            db.put_at(f"k{i}", i, T0 + timedelta(seconds=i))
-    with TimeDB.open(path, SAVE_EVENTS, SAVE_SECONDS, SEG_TINY, FSYNC) as loaded:
+            db.put(f"k{i}", i, T0 + timedelta(seconds=i))
+
+    with TimeDB.open(path) as loaded:
         snap = loaded.at_time(T0 + timedelta(seconds=15))
         assert snap.get("k15") == 15
         assert snap.get("k16") is ABSENT
-
-
-# -- live reads across active/sealed boundary --
-
-def test_live_snapshot_into_sealed_region(tmp_path):
-    path = tmp_path / "db"
-    with TimeDB.open(path, SAVE_EVENTS, SAVE_SECONDS, SEG_TINY, FSYNC) as db:
-        for i in range(50):
-            db.put_at(f"k{i}", i, T0 + timedelta(seconds=i))
-        db.flush()
-        snap = db.at(10)
-        assert snap.get("k9") == 9
-        assert snap.get("k10") is ABSENT
-
-def test_live_between_spans_boundary(tmp_path):
-    path = tmp_path / "db"
-    with TimeDB.open(path, SAVE_EVENTS, SAVE_SECONDS, SEG_TINY, FSYNC) as db:
-        for i in range(50):
-            db.put_at(f"k{i}", i, T0 + timedelta(seconds=i))
-        db.flush()
-        seqs = [e.seq for e in db.between(5, 45)]
-        assert seqs == list(range(5, 45))
-
-def test_live_event_at_in_sealed_region(tmp_path):
-    path = tmp_path / "db"
-    with TimeDB.open(path, SAVE_EVENTS, SAVE_SECONDS, SEG_TINY, FSYNC) as db:
-        for i in range(50):
-            db.put_at(f"k{i}", i, T0 + timedelta(seconds=i))
-        db.flush()
-        assert db.at(5).timestamp() == T0 + timedelta(seconds=4)
-
-def test_live_tx_events_across_boundary(tmp_path):
-    path = tmp_path / "db"
-    with TimeDB.open(path, SAVE_EVENTS, SAVE_SECONDS, SEG_TINY, FSYNC) as db:
-        tx, _ = db.apply_at({"a": 1, "b": 2, "c": 3}, T0)
-        for i in range(50):
-            db.put_at(f"k{i}", i, T0 + timedelta(seconds=i + 1))
-        db.flush()
-        assert [e.key for e in db.tx_events(tx)] == ["a", "b", "c"]
-
-
 
 
 # -- crash recovery property test --
@@ -899,31 +726,18 @@ def test_recovery_truncation_is_prefix(tmp_path):
     n_events = 12
     originals = [(f"k{i}", i, T0 + timedelta(seconds=i)) for i in range(n_events)]
 
-    with TimeDB.open(path, save_events=1, save_seconds=0.001,
-                     segment_bytes=SEG_TINY, fsync_mode="save") as db:
+    with TimeDB.open(path) as db:
         for k, v, t in originals:
-            db.put_at(k, v, t)
-        db.flush()
+            db.put(k, v, t)
 
-    snapshot = {p.name: p.read_bytes() for p in path.iterdir()}
-    log_files = sorted(n for n in snapshot if n.endswith(".log"))
-    active_log = log_files[-1]
-    active_bytes = snapshot[active_log]
+    full_bytes = path.read_bytes()
 
-    def restore():
-        for p in list(path.iterdir()):
-            p.unlink()
-        for name, content in snapshot.items():
-            (path / name).write_bytes(content)
-
-    offsets = sorted({0, len(active_bytes), len(active_bytes) // 2,
-                      max(0, len(active_bytes) - 5)})
+    offsets = sorted({0, len(full_bytes), len(full_bytes) // 2,
+                      max(0, len(full_bytes) - 5)})
     for offset in offsets:
-        restore()
-        (path / active_log).write_bytes(active_bytes[:offset])
+        path.write_bytes(full_bytes[:offset])
 
-        with TimeDB.open(path, save_events=SAVE_EVENTS, save_seconds=SAVE_SECONDS,
-                         segment_bytes=SEG_TINY, fsync_mode="none") as db:
+        with TimeDB.open(path) as db:
             recovered = [(e.key, e.value, e.timestamp) for e in db.events()]
 
         assert recovered == originals[:len(recovered)], (
@@ -941,18 +755,14 @@ def test_lock_prevents_concurrent_writers(tmp_path):
         sys.path.insert(0, {repr(str(repo))})
         from timedb.db import TimeDB
         try:
-            with TimeDB.open(
-                {repr(str(path))}, save_events=1000, save_seconds=1.0,
-                segment_bytes=4096, fsync_mode="none",
-            ) as db:
+            with TimeDB.open({repr(str(path))}) as db:
                 pass
             print("OPENED")
         except RuntimeError as e:
             print(f"LOCKED:{{e}}")
     """)
 
-    with TimeDB.open(path, save_events=1000, save_seconds=1.0,
-                     segment_bytes=4096, fsync_mode="none"):
+    with TimeDB.open(path):
         result = subprocess.run(
             [sys.executable, "-c", code],
             capture_output=True, text=True, timeout=10,
@@ -961,13 +771,3 @@ def test_lock_prevents_concurrent_writers(tmp_path):
     assert "LOCKED:" in result.stdout, (
         f"expected lock conflict; stdout={result.stdout!r} stderr={result.stderr!r}"
     )
-
-def test_lock_released_after_close(tmp_path):
-    path = tmp_path / "db"
-    with TimeDB.open(path, save_events=1000, save_seconds=1.0,
-                     segment_bytes=4096, fsync_mode="none") as db:
-        db.put_at("x", 1, T0)
-
-    with TimeDB.open(path, save_events=1000, save_seconds=1.0,
-                     segment_bytes=4096, fsync_mode="none") as db:
-        assert db.latest().get("x") == 1

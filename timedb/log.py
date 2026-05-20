@@ -1,6 +1,6 @@
 from bisect import bisect_left, bisect_right
 from itertools import accumulate, groupby, islice, takewhile
-from typing import Iterable, Iterator, Sequence
+from typing import Iterable, Iterator, Sequence, Optional
 from pathlib import Path
 from datetime import datetime
 
@@ -11,9 +11,8 @@ from .types import Event, OptValue, EMPTY, fold_batch
 
 
 class Log:
-    def __init__(self, events: Iterable[Event], strict_time: bool):
+    def __init__(self, events: Iterable[Event]):
         self._events = list(events)
-        self._strict_time = strict_time
         batches = [
             list(g) 
             for _, g in groupby(
@@ -25,8 +24,12 @@ class Log:
         self._tx_timestamps = [b[0].timestamp for b in batches]
 
     @staticmethod
-    def open(log_path: Path, strict_time: bool) -> "Log":
-        return Log(journal.read(log_path), strict_time)
+    def open(log_path: Path) -> "Log":
+        return Log(journal.read(log_path))
+
+    @staticmethod
+    def in_memory() -> "Log":
+        return Log([])
 
     def _on_batch(self, batch: list[Event]):
         pass
@@ -45,14 +48,10 @@ class Log:
 
     def append(self, writes: dict[str, OptValue], at: datetime) -> int:
         if not writes:
-            return self.num_transactions()
-        if (
-            self._strict_time
-            and self._events
-            and at < self._events[-1].timestamp
-        ):
+            raise ValueError("apply called with no writes")
+        if self._events and at < self._events[-1].timestamp:
             raise ValueError(
-                f"strict_time: timestamp {at.isoformat()} is before last "
+                f"timestamp {at.isoformat()} is before last "
                 f"event timestamp {self._events[-1].timestamp.isoformat()}"
             )
         tx = self.num_transactions()
@@ -77,25 +76,23 @@ class Log:
             islice(self._events, lo, None)
         )
 
-    def tx_as_of(self, t: datetime) -> int:
-        if self._tx_timestamps and t >= self._tx_timestamps[0]:
-            return bisect_right(self._tx_timestamps, t)
-        else:
-            return 0
+    def last_tx(self, t: datetime) -> Optional[int]:
+        n = bisect_right(self._tx_timestamps, t)
+        return n - 1 if n > 0 else None
 
 
 class DurableLog(Log):
     def __init__(
-        self, events: Iterable[Event], strict_time: bool, log_path: Path
+        self, events: Iterable[Event], log_path: Path
     ):
-        super().__init__(events, strict_time)
+        super().__init__(events)
         self._log_path = log_path
         self._pending: list[list[Event]] = []
 
     @staticmethod
-    def open(log_path: Path, strict_time: bool) -> "DurableLog":
+    def open(log_path: Path) -> "DurableLog":
         return DurableLog(
-            journal.read_and_recover(log_path), strict_time, log_path
+            journal.read_and_recover(log_path), log_path
         )
 
     def _on_batch(self, batch: list[Event]):

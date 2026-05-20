@@ -1,62 +1,35 @@
-from bisect import bisect_right
-from itertools import accumulate
-from typing import Optional, Iterable, Iterator, Sequence
+from bisect import bisect_left, bisect_right
+from itertools import accumulate, groupby, islice, takewhile
+from typing import Iterable, Iterator, Sequence
 from pathlib import Path
 from datetime import datetime
 
 import immutables
 
 from . import journal
-from .types import Event, OptValue, EMPTY, fold_event
+from .types import Event, OptValue, EMPTY, fold_batch
 
 
 class Log:
     def __init__(self, events: Iterable[Event], strict_time: bool):
         self._events = list(events)
-        self._roots = list(accumulate(self._events, fold_event, initial=EMPTY))
         self._strict_time = strict_time
-
-    @classmethod
-    def in_memory(cls, strict_time: bool) -> "Log":
-        return cls([], strict_time)
-
-    @classmethod
-    def open(cls, log_path: Path, strict_time: bool) -> "DurableLog":
-        return DurableLog(
-            journal.read_and_recover(log_path), strict_time, log_path
-        )
-
-    def append(
-        self, writes: dict[str, OptValue], at: datetime, tx: bool
-    ) -> tuple[int, int]:
-        first_seq = len(self._events)
-        tx_id = len(self._events) if tx else None
-        for key, value in writes.items():
-            self._publish(key, value, at, tx_id)
-        return (first_seq, len(self._events))
-
-    def _publish(
-        self, 
-        key: str, 
-        value: OptValue, 
-        at: datetime, 
-        tx_id: Optional[int]
-    ):
-        if (
-            self._strict_time 
-            and self._events 
-            and at < self._events[-1].timestamp
-        ):
-            raise ValueError(
-                f"strict_time: timestamp {at.isoformat()} is before last "
-                f"event timestamp {self._events[-1].timestamp.isoformat()}"
+        batches = [
+            list(g) 
+            for _, g in groupby(
+                self._events,
+                key=lambda e: e.tx
             )
+        ]
+        self._roots = list(accumulate(batches, fold_batch, initial=EMPTY))
+        self._tx_timestamps = [b[0].timestamp for b in batches]
 
-        event = Event(
-            len(self._events), key, value, at, tx_id
-        )
-        self._events.append(event)
-        self._roots.append(fold_event(self._roots[-1], event))
+    @staticmethod
+    def open(log_path: Path, strict_time: bool) -> "Log":
+        return Log(journal.read(log_path), strict_time)
+
+    def _on_batch(self, batch: list[Event]):
+        pass
 
     def events(self) -> Sequence[Event]:
         return self._events
@@ -64,24 +37,51 @@ class Log:
     def states(self) -> Sequence[immutables.Map]:
         return self._roots
 
-    def seq_as_of(self, t: datetime) -> int:
-        if self._events and t >= self._events[0].timestamp:
-            return bisect_right(self._events, t, key=lambda e: e.timestamp)
-        else:
-            return 0
+    def num_transactions(self) -> int:
+        return len(self._tx_timestamps)
 
-    def tx_exists(self, tx_id: int) -> bool:
-        return (
-            0 <= tx_id < len(self._events)
-            and self._events[tx_id].tx_id == tx_id
+    def tx_timestamp(self, tx: int) -> datetime:
+        return self._tx_timestamps[tx]
+
+    def append(self, writes: dict[str, OptValue], at: datetime) -> int:
+        if not writes:
+            return self.num_transactions()
+        if (
+            self._strict_time
+            and self._events
+            and at < self._events[-1].timestamp
+        ):
+            raise ValueError(
+                f"strict_time: timestamp {at.isoformat()} is before last "
+                f"event timestamp {self._events[-1].timestamp.isoformat()}"
+            )
+        tx = self.num_transactions()
+        batch = [Event(tx, k, v, at) for k, v in writes.items()]
+        self._events.extend(batch)
+        self._roots.append(fold_batch(self._roots[-1], batch))
+        self._tx_timestamps.append(at)
+        self._on_batch(batch)
+        return tx
+
+    def events_at(self, tx: int) -> Iterator[Event]:
+        lo = bisect_left(self._events, tx, key=lambda e: e.tx)
+        return takewhile(
+            lambda e: e.tx == tx,
+            islice(self._events, lo, None)
         )
 
-    def tx_events(self, tx_id: int) -> Iterator[Event]:
-        for i in range(tx_id, len(self._events)):
-            e = self._events[i]
-            if e.tx_id != tx_id:
-                return
-            yield e
+    def events_between(self, tx_lo: int, tx_hi: int) -> Iterator[Event]:
+        lo = bisect_left(self._events, tx_lo, key=lambda e: e.tx)
+        return takewhile(
+            lambda e: e.tx < tx_hi,
+            islice(self._events, lo, None)
+        )
+
+    def tx_as_of(self, t: datetime) -> int:
+        if self._tx_timestamps and t >= self._tx_timestamps[0]:
+            return bisect_right(self._tx_timestamps, t)
+        else:
+            return 0
 
 
 class DurableLog(Log):
@@ -90,15 +90,18 @@ class DurableLog(Log):
     ):
         super().__init__(events, strict_time)
         self._log_path = log_path
-        self._persisted_count = len(self._events)
+        self._pending: list[list[Event]] = []
+
+    @staticmethod
+    def open(log_path: Path, strict_time: bool) -> "DurableLog":
+        return DurableLog(
+            journal.read_and_recover(log_path), strict_time, log_path
+        )
+
+    def _on_batch(self, batch: list[Event]):
+        self._pending.append(batch)
 
     def save(self):
-        if (
-            self._log_path is not None
-            and len(self._events) > self._persisted_count
-        ):
-            journal.append_events(
-                self._log_path,
-                self._events[self._persisted_count:]
-            )
-            self._persisted_count = len(self._events)
+        if self._pending:
+            journal.append_batches(self._log_path, self._pending)
+            self._pending.clear()

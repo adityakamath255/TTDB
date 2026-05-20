@@ -11,8 +11,7 @@ class Interval:
         self._hi = hi
 
     def __iter__(self) -> Iterator[Event]:
-        for i in range(self._lo, self._hi):
-            yield self._log.events()[i]
+        return self._log.events_between(self._lo, self._hi)
 
     def history(self, key: str) -> Iterator[Event]:
         return (e for e in self if e.key == key)
@@ -20,11 +19,5 @@ class Interval:
     def keys_touched(self) -> set[str]:
         return {e.key for e in self}
 
-    def tx_ids(self) -> set[int]:
-        return {e.tx_id for e in self if e.tx_id is not None}
-
-    def count(self) -> int:
-        return self._hi - self._lo
-
     def __repr__(self) -> str:
-        return f"Interval(seq=[{self._lo}, {self._hi}))"
+        return f"Interval(tx=[{self._lo}, {self._hi}))"

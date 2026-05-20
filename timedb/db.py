@@ -29,91 +29,68 @@ class TimeDB:
     def __init__(self, log: Log):
         self._log = log
 
-    @classmethod
-    def open_readonly(cls, path: str | Path) -> "TimeDB":
+    @staticmethod
+    def open_readonly(path: str | Path) -> "TimeDB":
         return TimeDB(Log.open(Path(path), False))
 
-    @classmethod
-    def in_memory(cls, strict_time: bool = False) -> "WritableTimeDB":
-        return WritableTimeDB(Log.in_memory(strict_time))
+    @staticmethod
+    def in_memory(strict_time: bool = False) -> "WritableTimeDB":
+        return WritableTimeDB(Log([], strict_time))
 
-    @classmethod
-    def open(
-        cls, path: str | Path, strict_time: bool = False
-    ) -> "DurableTimeDB":
+    @staticmethod
+    def open(path: str | Path, strict_time: bool = False) -> "DurableTimeDB":
         path = Path(path)
         lock_fd = _acquire_lock(path)
         try:
-            log = Log.open(path, strict_time)
+            log = DurableLog.open(path, strict_time)
         except BaseException:
             _release_lock(lock_fd)
             raise
         return DurableTimeDB(log, lock_fd)
 
-    def at(self, seq: int) -> Snapshot:
-        n = len(self.events())
-        if not (0 <= seq <= n):
+    def at(self, tx: int) -> Snapshot:
+        n = self._log.num_transactions()
+        if not (0 <= tx < n):
             raise ValueError(
-                f"invalid seq {seq}: log has {n} events"
+                f"invalid transaction {tx}: log has {n} transactions"
             )
-        return Snapshot(
-            seq,
-            self._log.states()[seq],
-            self.events()[seq - 1].timestamp if seq > 0 else None
-        )
+        return Snapshot(tx, self._log)
 
     def latest(self) -> Snapshot:
-        return self.at(len(self.events()))
+        return self.at(self._log.num_transactions())
 
     def as_of(self, t: datetime) -> Snapshot:
-        return self.at(self._log.seq_as_of(t))
+        return self.at(self._log.tx_as_of(t))
 
     def events(self) -> Sequence[Event]:
         return self._log.events()
 
-    def between(self, seq0: int, seq1: int) -> Interval:
-        n = len(self.events())
-        if not (0 <= seq0 <= seq1 <= n):
+    def events_in_tx(self, tx: int) -> Iterator[Event]:
+        if not 0 <= tx < self._log.num_transactions():
+            raise ValueError(f"Transaction {tx} does not exist")
+        return self._log.events_at(tx)
+
+    def between(self, tx0: int, tx1: int) -> Interval:
+        n = self._log.num_transactions()
+        if not (0 <= tx0 <= tx1 <= n):
             raise ValueError(
-                f"invalid range: seq0={seq0}, seq1={seq1}, "
-                f"log has {n} events"
+                f"invalid range: tx0={tx0}, tx1={tx1}, "
+                f"log has {n} transactions"
             )
-        return Interval(self._log, seq0, seq1)
-
-    def history(self, key: str) -> Iterator[Event]:
-        return self.between(0, len(self.events())).history(key)
-
-    def tx_events(self, tx_id: int) -> Iterator[Event]:
-        if not self._log.tx_exists(tx_id):
-            raise ValueError(f"Transaction {tx_id} does not exist")
-        return self._log.tx_events(tx_id)
+        return Interval(self._log, tx0, tx1)
 
     def __repr__(self) -> str:
-        n = len(self.events())
-        return f"TimeDB({n} {'events' if n != 1 else 'event'})"
+        n = self._log.num_transactions()
+        return f"TimeDB({n} {'transactions' if n != 1 else 'transaction'})"
 
 
 class WritableTimeDB(TimeDB):
-    def __init__(self, log: Log):
-        super().__init__(log)
-
-    def put(
-        self, key: str, value: OptValue, at: Optional[datetime] = None
+    def apply(
+        self, writes: dict[str, OptValue], at: Optional[datetime] = None
     ) -> int:
         if at is None:
             at = datetime.now()
-        return self._log.append({key: value}, at, tx=False)[0]
-
-    def delete(self, key: str, at: Optional[datetime] = None) -> int:
-        return self.put(key, ABSENT, at)
-
-    def apply(
-        self, writes: dict[str, OptValue], at: Optional[datetime] = None
-    ) -> tuple[int, int]:
-        if at is None:
-            at = datetime.now()
-        result = self._log.append(writes, at, tx=True)
-        return result
+        return self._log.append(writes, at)
 
 
 class DurableTimeDB(WritableTimeDB):

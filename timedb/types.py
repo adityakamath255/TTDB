@@ -1,6 +1,7 @@
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Optional
+from functools import reduce
+from typing import Iterable
 
 import immutables
 
@@ -19,11 +20,10 @@ OptValue = Value | Absent
 
 @dataclass(frozen=True, slots=True)
 class Event:
-    seq: int
+    tx: int
     key: str
     value: OptValue
     timestamp: datetime
-    tx_id: Optional[int]
 
 
 def fold_event(root: immutables.Map, event: Event) -> immutables.Map:
@@ -33,3 +33,7 @@ def fold_event(root: immutables.Map, event: Event) -> immutables.Map:
         return root.delete(event.key)
     else:
         return root
+
+
+def fold_batch(root: immutables.Map, batch: Iterable[Event]) -> immutables.Map:
+    return reduce(fold_event, batch, root)

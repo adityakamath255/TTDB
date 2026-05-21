@@ -1,30 +1,40 @@
 # TimeDB
 
-An append-only key-value store for Python that retains full history. Every write is recorded as an immutable event. Past states are queryable by transaction index or timestamp. Nothing is ever overwritten.
+An append-only key-value store for Python that retains full history. Every transaction is recorded as an immutable event in a log. Past states are queryable by sequence number or timestamp. Nothing is ever overwritten.
 
 ---
 
-## How it works
+## Model
 
-All writes go into a log as `Event` objects with a transaction id, key, value, and timestamp. Append-only is the core invariant; everything else derives from it. Deletion is a write of the sentinel value `ABSENT`, which also represents "never existed" — one sentinel covers both cases. If you need to distinguish them, walk the event history.
+All writes go into a log of `Event` objects, each carrying a sequence number, a `changes` dict, and a timestamp. Append-only is the core invariant; everything else derives from it.
 
-A *transaction* is a group of one or more events with the same `tx` and timestamp, produced by a single `apply` call. Transactions are numbered `0, 1, 2, …` in commit order.
+A *transaction* is one `apply` call producing one event. Multiple keys in the same `apply` share that event. Atomicity is per-event, by construction. There is no separate "single write" code path: a one-key write is just the N=1 case of a multi-key write.
 
-State views are plain `immutables.Map` instances (HAMTs). Lookups are O(log n) and creating a snapshot is just an indexed access into the cached root chain — there's a root per transaction, kept in memory, structurally shared.
+Deletion is a write of the sentinel value `ABSENT`, which also represents "never existed." One sentinel covers both cases; if you need to distinguish them, walk the event history.
 
-The database itself comes in three flavors arranged as a capability ladder:
+State views are plain `immutables.Map` instances (HAMTs). Each event produces a new root by folding its changes into the prior root; structural sharing keeps every root cheap. Roots are cached, one per event plus an empty root at index 0. Lookups are O(log n); time-travel to a known sequence is O(1).
 
-- `TimeDB` — read-only. Returned by `TimeDB.open_readonly(path)` or constructed directly from an iterable of events. No writes, no persistence side effects.
-- `WritableTimeDB` — adds in-memory writes via `apply`. Returned by `TimeDB.in_memory()`.
-- `DurableTimeDB` — adds journal persistence and a process-wide write lock. Returned by `TimeDB.open(path)`.
+## The capability ladder
 
-Type checkers enforce the ladder. Calling `.apply()` on a `TimeDB.open_readonly` handle is a type error, not a runtime error, because the method doesn't exist on the read-only class.
+Three classes, ordered by capability:
+
+- `DB`: read-only. Returns immutable Maps; no writes available.
+- `WritableDB`: adds in-memory writes via `apply`.
+- `DurableDB`: adds journal persistence and a process-wide write lock.
+
+Each is constructed via a module-level factory:
+
+- `timedb.view(path)` → `DB`
+- `timedb.empty()` → `WritableDB`
+- `timedb.open(path)` → `DurableDB`
+
+The ladder is encoded in the type system. Calling `.apply()` on a `DB` handle is a type error, not a runtime error, since the method doesn't exist on the read-only class.
 
 ---
 
 ## Installation
 
-Depends on `immutables` (HAMT). Copy the `timedb` package directory into your project.
+Depends on `immutables` (HAMT). Copy `timedb.py` into your project.
 
 ---
 
@@ -33,10 +43,9 @@ Depends on `immutables` (HAMT). Copy the `timedb` package directory into your pr
 ### In-memory
 
 ```python
-from timedb import TimeDB
+import timedb
 
-db = TimeDB.in_memory()
-
+db = timedb.empty()
 db.apply({"user.name": "alice"})
 db.apply({"user.name": "bob"})
 
@@ -46,53 +55,53 @@ print(db.latest()["user.name"])  # "bob"
 ### Persistent
 
 ```python
-with TimeDB.open(path) as db:
+with timedb.open(path) as db:
     db.apply({"user.name": "alice"})
 ```
 
-`path` is the journal file itself, not a directory. Writes accumulate in memory; `db.save()` appends new events to the journal with fsync. Context-manager exit calls `save` automatically. Crash before save loses the unsaved tail; recovery on next open scans for the last complete transaction (marked by a `"final": true` event) and truncates any partial trailing bytes.
+`path` is the journal file itself, not a directory. Writes accumulate in memory; `db.save()` appends them to the journal with fsync. Context-manager exit calls `save` automatically. Crash before save loses the unsaved tail; recovery on next open truncates any partial trailing bytes.
 
-Opening also acquires an exclusive `flock` on the journal file. A second process trying to open the same path raises `RuntimeError`. The lock is released on context-manager exit, or by the kernel if the process crashes.
+Opening acquires an exclusive `flock` on the journal file. A second process trying to open the same path raises `RuntimeError`. The lock is released on context-manager exit, or by the kernel on process exit.
 
 ### Read-only
 
 ```python
-ro = TimeDB.open_readonly(path)
+ro = timedb.view(path)
 print(ro.latest().get("user.name"))
 ```
 
-Returns a `TimeDB` (the read-only base class). No lock acquired, no writes available. Multiple read-only handles can coexist.
+No lock acquired, no writes available. Multiple read-only handles can coexist. A read-only handle does not refresh as a concurrent writer extends the journal, it sees the snapshot at open time.
 
 ### Time travel
 
 ```python
-snap = db.at(0)
-print(snap["user.name"])  # state after the first transaction
+snap = db.at(0)        # empty pre-state
+snap = db.at(2)        # state after applying the first 2 events
+snap = db.latest()     # state after applying all events
 ```
 
-`at(tx)` is the state after applying transaction `tx`. `db.latest()` is shorthand for the state after the most recent transaction. Transaction indices start at zero.
+`at(seq)` is the state with `seq` events applied. `at(0)` returns the empty pre-state and is part of the address space by design; `latest()` is `at(len(db.events()))`.
 
-You can also travel by timestamp:
+By timestamp:
 
 ```python
 snap = db.as_of(some_datetime)
-print(snap.get("user.name"))
 ```
 
-`as_of(t)` returns the state reflecting every transaction with timestamp ≤ t. Lookup is O(log n) via binary search, which assumes timestamps are non-decreasing across transactions. `apply` enforces this at write time: a timestamp earlier than the last event raises `ValueError`.
+`as_of(t)` returns the state reflecting every event with timestamp <= t. Lookup is O(log n) via binary search, which assumes timestamps are non-decreasing across events. `apply` enforces this at write time: a timestamp earlier than the last event raises `ValueError`.
 
 ### Atomic writes
 
 ```python
-tx = db.apply({
+seq = db.apply({
     "order.id": 42,
     "order.status": "pending",
 })
 ```
 
-All keys in a single `apply` call share the same transaction index and timestamp. The return value is the index of the committed transaction. An empty dict raises `ValueError`.
+Every key in a single `apply` belongs to the same event and shares a `seq` and `timestamp`. The return value is the sequence number of the committed event.
 
-Deletion is a write of `ABSENT`:
+Deletion:
 
 ```python
 from timedb import ABSENT
@@ -101,59 +110,64 @@ db.apply({"user.name": ABSENT})
 print(db.latest().get("user.name"))  # None (key absent)
 ```
 
+### Iterating events
+
+```python
+for event in db.events():
+    print(event.seq, event.changes, event.timestamp)
+```
+
+`db.events()` returns the full event list. Windowed access, single-event access, and counts are all list operations:
+
+```python
+db.events()[lo:hi]
+db.events()[seq]
+len(db.events())
+db.events()[seq].timestamp
+```
+
 ### Diffing snapshots
 
 ```python
 from timedb import diff
 
-a = db.at(0)
-b = db.latest()
-
-for key, lo, hi in diff(a, b):
-    print(key, lo, hi)
+for key, before, after in diff(db.at(0), db.latest()):
+    print(key, before, after)
 ```
 
 `diff(a, b)` yields `(key, value_in_a, value_in_b)` for every key where the two snapshots disagree. `ABSENT` represents "not present in this snapshot."
-
-### Iterating events
-
-```python
-for event in db.events():
-    print(event.tx, event.key, event.value)
-
-for event in db.between(0, 3):
-    print(event.tx, event.key, event.value)
-
-for event in db.events_at(tx):
-    print(event.key, event.value)
-```
-
-- `db.events()` returns every event in commit order.
-- `db.between(tx_lo, tx_hi)` returns events from transactions in the half-open range `[tx_lo, tx_hi)`.
-- `db.events_at(tx)` returns just the events from one transaction.
 
 ### History of a key
 
 ```python
 from timedb import history
 
-for event in history(db.events(), "user.name"):
-    print(event.tx, event.value, event.timestamp)
+for seq, value, ts in history(db.events(), "user.name"):
+    print(seq, value, ts)
 ```
 
-`history(events, key)` filters any event iterable down to the events for a single key. Compose with `db.between(...)` to scope to a window.
+`history(events, key)` yields `(seq, value, timestamp)` tuples for every event whose `changes` touched `key`. Compose with slicing for windowed history:
 
-### Other accessors
+```python
+history(db.events()[lo:hi], "user.name")
+```
 
-- `db.num_transactions()` — count of committed transactions.
-- `db.tx_timestamp(tx)` — timestamp of transaction `tx`.
+Both `diff` and `history` are module-level rather than methods. They operate on values (Maps, event iterables) that already carry everything they need.
 
 ---
 
 ## Values
 
-Accepted value types are `str`, `int`, `float`, `bool`, `None`, and arbitrarily nested `list` and `dict` combinations with string keys. The recursive type alias `Value` in `timedb.types` encodes this exactly. Validation happens at type-check time, not runtime — pass anything other than a `Value` and pyright or mypy will reject the call.
+Accepted value types are `str`, `int`, `float`, `bool`, `None`, and arbitrarily nested `list` and `dict` combinations with string keys. The recursive type alias `Value` encodes this exactly. Validation happens at type-check time, not runtime; pass anything other than a `Value` and pyright or mypy will reject the call.
 
 The constraint comes from the on-disk log being JSONL: it should stay readable from any language.
 
 ---
+
+## Durability and recovery
+
+The journal is JSONL, one event per line. Each line carries the event's `seq`, `changes` (as a dict of tagged-union values), and `timestamp`.
+
+Recovery: read lines until one fails to parse or is missing a trailing newline, then truncate the file to the last good byte. There are no commit records and no two-phase writes. Newline framing IS the transaction boundary, because every transaction is one event and every event is one line. Torn trailing writes are caught by the missing newline; corruption is caught by JSON parse failure. Same recovery guarantees as a flagged protocol, fewer moving parts.
+
+`save()` appends pending events and fsyncs. The context manager calls `save()` on exit.

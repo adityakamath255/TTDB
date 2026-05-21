@@ -70,17 +70,17 @@ ro = timedb.view(path)
 print(ro.latest().get("user.name"))
 ```
 
-No lock acquired, no writes available. Multiple read-only handles can coexist. A read-only handle does not refresh as a concurrent writer extends the journal, it sees the snapshot at open time.
+No lock acquired, no writes available. Multiple read-only handles can coexist. A read-only handle does not refresh as a concurrent writer extends the journal, it sees the snapshot at open time. Calling `view` on a path that does not exist raises `FileNotFoundError`.
 
 ### Time travel
 
 ```python
-snap = db.at(0)        # empty pre-state
-snap = db.at(2)        # state after applying the first 2 events
-snap = db.latest()     # state after applying all events
+snap = db.at(0)        # state after the first event
+snap = db.at(1)        # state after the second event
+snap = db.latest()     # state after all events
 ```
 
-`at(seq)` is the state with `seq` events applied. `at(0)` returns the empty pre-state and is part of the address space by design; `latest()` is `at(len(db.events()))`.
+`at(seq)` is the state after event `seq`, symmetric with `events()[seq]` — both index the same event. Valid range is `[0, len(db.events()))`; `at(len(db.events()) - 1)` equals `latest()`. The empty pre-state is not addressable via `at`; reach it with `as_of(t)` for any `t` earlier than every event.
 
 By timestamp:
 
@@ -93,13 +93,13 @@ snap = db.as_of(some_datetime)
 ### Atomic writes
 
 ```python
-seq = db.apply({
+event = db.apply({
     "order.id": 42,
     "order.status": "pending",
 })
 ```
 
-Every key in a single `apply` belongs to the same event and shares a `seq` and `timestamp`. The return value is the sequence number of the committed event.
+Every key in a single `apply` belongs to the same event and shares a `seq` and `timestamp`. The return value is the committed `Event` itself, so the assigned `seq` and `timestamp` are available without a follow-up lookup.
 
 Deletion:
 
@@ -158,9 +158,9 @@ Both `diff` and `history` are module-level rather than methods. They operate on 
 
 ## Values
 
-Accepted value types are `str`, `int`, `float`, `bool`, `None`, and arbitrarily nested `list` and `dict` combinations with string keys. The recursive type alias `Value` encodes this exactly. Validation happens at type-check time, not runtime; pass anything other than a `Value` and pyright or mypy will reject the call.
+Accepted value types are JSON primitives only: `str`, `int`, `float`, `bool`, `None`. The `Value` type alias encodes this exactly. Validation happens at type-check time, not runtime; pass anything other than a `Value` and pyright or mypy will reject the call.
 
-The constraint comes from the on-disk log being JSONL: it should stay readable from any language.
+Two constraints drove the choice. The journal is JSONL and must stay readable from any language. And in a versioned store, composite values fight the grain: mutating one element of a stored list or dict is read-modify-write, every change re-serializes the whole composite into the journal, and `diff`/`history` lose granularity (a changed element shows up as "the whole list changed"). Nested entity data flattens to namespaced keys (`user.address.street`, etc.); opaque blobs can JSON-stringify into a `str`.
 
 ---
 

@@ -87,10 +87,6 @@ class TestSerialization:
         True,
         False,
         None,
-        [1, 2, 3],
-        [],
-        {},
-        {"nested": {"deeply": [1, 2, {"k": "v"}]}},
     ])
     def test_value_round_trip(self, value):
         e = make_event(0, {"k": value})
@@ -238,19 +234,17 @@ class TestDB:
 
     def test_at_semantics(self):
         """
-        Documents the current at(seq) behavior.
-
-        at(seq) returns the state of the database BEFORE the event with that
-        seq was applied. at(0) is always the empty initial state when events
-        exist. To get the state after all events, use latest().
+        at(seq) returns the state AFTER event[seq] was applied. Symmetric with
+        events()[seq]: same index space, both refer to the seq-th event.
+        at(n - 1) equals latest(). The pre-state is not addressable via at.
         """
         db = DB([
             make_event(0, {"a": "v0"}),
             make_event(1, {"a": "v1"}),
         ])
-        assert dict(db.at(0)) == {}              # before e0
-        assert dict(db.at(1)) == {"a": "v0"}     # after e0, before e1
-        assert dict(db.latest()) == {"a": "v1"}  # after all events
+        assert dict(db.at(0)) == {"a": "v0"}     # after e0
+        assert dict(db.at(1)) == {"a": "v1"}     # after e1 (== latest)
+        assert dict(db.latest()) == {"a": "v1"}
 
     def test_at_rejects_negative(self):
         db = DB([make_event(0, {"a": 1})])
@@ -308,11 +302,20 @@ class TestWritableDB:
         assert isinstance(db, WritableDB)
         assert dict(db.latest()) == {}
 
-    def test_apply_returns_increasing_seq(self):
+    def test_apply_returns_event_with_seq(self):
         db = empty()
-        assert db.apply({"a": 1}) == 0
-        assert db.apply({"b": 2}) == 1
-        assert db.apply({"c": 3}) == 2
+        e0 = db.apply({"a": 1})
+        e1 = db.apply({"b": 2})
+        e2 = db.apply({"c": 3})
+        assert isinstance(e0, Event)
+        assert (e0.seq, e1.seq, e2.seq) == (0, 1, 2)
+
+    def test_apply_returns_event_with_assigned_timestamp(self):
+        db = empty()
+        before = datetime.now()
+        event = db.apply({"a": 1})
+        after = datetime.now()
+        assert before <= event.timestamp <= after
 
     def test_apply_updates_latest(self):
         db = empty()
@@ -353,8 +356,8 @@ class TestWritableDB:
 
     def test_apply_empty_changes(self):
         db = empty()
-        seq = db.apply({})
-        assert seq == 0
+        event = db.apply({})
+        assert event.seq == 0
         assert dict(db.latest()) == {}
         assert len(db.events()) == 1
 
@@ -422,10 +425,10 @@ class TestDurableDB:
     def test_seq_continues_across_reopens(self, tmp_path):
         log = tmp_path / "db.log"
         with db_open(log) as db:
-            assert db.apply({"a": 1}) == 0
-            assert db.apply({"b": 2}) == 1
+            assert db.apply({"a": 1}).seq == 0
+            assert db.apply({"b": 2}).seq == 1
         with db_open(log) as db:
-            assert db.apply({"c": 3}) == 2
+            assert db.apply({"c": 3}).seq == 2
 
     def test_log_format_is_one_json_per_line(self, tmp_path):
         log = tmp_path / "db.log"
@@ -575,9 +578,9 @@ class TestView:
             v = view(log)
             assert v.latest()["a"] == 1
 
-    def test_view_on_nonexistent_file(self, tmp_path):
-        v = view(tmp_path / "missing.log")
-        assert dict(v.latest()) == {}
+    def test_view_on_nonexistent_file_raises(self, tmp_path):
+        with pytest.raises(FileNotFoundError):
+            view(tmp_path / "missing.log")
 
     def test_view_does_not_modify_torn_writes(self, tmp_path):
         # view uses _read (not _read_and_recover), so it must NOT truncate
@@ -600,15 +603,16 @@ class TestIntegration:
     def test_full_workflow(self, tmp_path):
         log = tmp_path / "db.log"
         with db_open(log) as db:
-            db.apply({"users:1": {"name": "Alice", "age": 30}})
-            db.apply({"users:2": {"name": "Bob", "age": 25}})
-            db.apply({"users:1": {"name": "Alice", "age": 31}})
-            db.apply({"users:2": ABSENT})
+            db.apply({"users:1.name": "Alice", "users:1.age": 30})
+            db.apply({"users:2.name": "Bob", "users:2.age": 25})
+            db.apply({"users:1.age": 31})
+            db.apply({"users:2.name": ABSENT, "users:2.age": ABSENT})
 
         with db_open(log) as db:
             latest = db.latest()
-            assert latest["users:1"]["age"] == 31
-            assert "users:2" not in latest
+            assert latest["users:1.age"] == 31
+            assert "users:2.name" not in latest
+            assert "users:2.age" not in latest
 
     def test_history_across_persistence(self, tmp_path):
         log = tmp_path / "db.log"
@@ -632,8 +636,8 @@ class TestIntegration:
             db.apply({"a": 99, "c": 3})
 
         v = view(log)
-        # at(1) is the state after the first event and before the second
-        old = v.at(1)
+        # at(0) is the state after the first event; latest() includes both
+        old = v.at(0)
         new = v.latest()
         changes = {(k, av, bv) for (k, av, bv) in diff(old, new)}
         assert changes == {

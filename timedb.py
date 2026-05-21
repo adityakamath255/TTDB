@@ -3,7 +3,7 @@ from datetime import datetime
 import json
 import os
 from pathlib import Path
-from typing import Iterable, Iterator, Optional, Sequence
+from collections.abc import Iterable, Iterator, Sequence, Mapping
 import fcntl
 from bisect import bisect_right
 from itertools import accumulate
@@ -17,42 +17,40 @@ class Absent:
 
 ABSENT = Absent()
 
-Value = str | int | float | bool | None | list["Value"] | dict[str, "Value"]
+Value = str | int | float | bool | None
 OptValue = Value | Absent
 
 
 @dataclass(frozen=True, slots=True)
 class Event:
     seq: int
-    changes: dict[str, OptValue]
+    changes: Mapping[str, OptValue]
     timestamp: datetime
 
 
 def _fold_event(root: immutables.Map, event: Event) -> immutables.Map:
-    new = root
+    new = root.mutate()
     for k, v in event.changes.items():
         if v is ABSENT:
             if k in new:
-                new = new.delete(k)
+                del new[k]
         else:
-            new = new.set(k, v)
-    return new
+            new[k] = v
+    return new.finish()
 
 
 def _serialize_value(value: OptValue) -> dict:
-    return (
-        {"type": "data", "data": value}
-        if value is not ABSENT
-        else {"type": "absent"}
-    )
+    if value is not ABSENT:
+        return {"type": "data", "data": value}
+    else:
+        return {"type": "absent"}
 
 
 def _deserialize_value(raw: dict) -> OptValue:
-    return (
-        raw["data"]
-        if raw["type"] != "absent"
-        else ABSENT
-    )
+    if raw["type"] != "absent":
+        return raw["data"]
+    else:
+        return ABSENT
 
 
 def _serialize_event(event: Event) -> dict:
@@ -75,17 +73,17 @@ def _read_intact(path: Path) -> tuple[list[Event], int]:
     events: list[Event] = []
     committed_bytes = 0
 
-    if path.exists():
-        with path.open("rb") as f:
-            for line in f:
-                if not line.endswith(b"\n"):
-                    break
-                try:
-                    event = _deserialize_event(json.loads(line))
-                except (json.JSONDecodeError, KeyError):
-                    break
-                events.append(event)
-                committed_bytes += len(line)
+    with path.open("rb") as f:
+        for line in f:
+            if not line.endswith(b"\n"):
+                break
+            try:
+                event = _deserialize_event(json.loads(line))
+            except (json.JSONDecodeError, KeyError):
+                break
+            events.append(event)
+            committed_bytes += len(line)
+
     return events, committed_bytes
 
 
@@ -99,15 +97,6 @@ def _read_and_recover(path: Path) -> list[Event]:
 
 def _read(path: Path) -> list[Event]:
     return _read_intact(path)[0]
-
-
-def _append_events(path: Path, events: Iterable[Event]):
-    with path.open("a") as f:
-        for event in events:
-            f.write(json.dumps(_serialize_event(event)))
-            f.write("\n")
-        f.flush()
-        os.fsync(f.fileno())
 
 
 def _acquire_lock(path: Path) -> int:
@@ -158,7 +147,7 @@ class DB:
             raise ValueError(
                 f"invalid seq {seq}: log has {n} events"
             )
-        return self._roots[seq]
+        return self._roots[seq + 1]
 
     def latest(self) -> immutables.Map:
         return self._roots[-1]
@@ -177,8 +166,8 @@ class WritableDB(DB):
         pass
 
     def apply(
-        self, changes: dict[str, OptValue], at: Optional[datetime] = None
-    ) -> int:
+        self, changes: dict[str, OptValue], at: datetime | None = None
+    ) -> Event:
         if at is None:
             at = datetime.now()
         if self._events and at < self._events[-1].timestamp:
@@ -187,17 +176,18 @@ class WritableDB(DB):
                 f"event timestamp {self._events[-1].timestamp.isoformat()}"
             )
         seq = len(self._events)
-        event = Event(seq, changes, at)
+        event = Event(seq, dict(changes), at)
+        new_root = _fold_event(self._roots[-1], event)
         self._events.append(event)
-        self._roots.append(_fold_event(self._roots[-1], event))
+        self._roots.append(new_root)
         self._on_event(event)
-        return seq
+        return event
 
 
 class DurableDB(WritableDB):
     def __init__(self, log_path: Path):
         self._log_path = log_path
-        self._pending: list[Event] = []
+        self._pending = bytearray()
         self._lock_fd = _acquire_lock(self._log_path)
         try:
             super().__init__(_read_and_recover(self._log_path))
@@ -206,11 +196,15 @@ class DurableDB(WritableDB):
             raise
 
     def _on_event(self, event: Event):
-        self._pending.append(event)
+        encoded = json.dumps(_serialize_event(event)).encode() + b"\n"
+        self._pending.extend(encoded)
 
     def save(self):
         if self._pending:
-            _append_events(self._log_path, self._pending)
+            with self._log_path.open("ab") as f:
+                f.write(self._pending)
+                f.flush()
+                os.fsync(f.fileno())
             self._pending.clear()
 
     def __enter__(self) -> "DurableDB":
@@ -228,7 +222,10 @@ def open(log_path: str | Path) -> DurableDB:
 
 
 def view(path: str | Path) -> DB:
-    return DB(_read(Path(path)))
+    path = Path(path)
+    if not path.exists():
+        raise FileNotFoundError(path)
+    return DB(_read(path))
 
 
 def empty() -> WritableDB:

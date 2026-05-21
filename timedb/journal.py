@@ -23,29 +23,24 @@ def _deserialize_value(raw: dict) -> OptValue:
     )
 
 
-def _serialize_event(event: Event, final: bool) -> dict:
+def _serialize_event(event: Event) -> dict:
     return {
-        "tx": event.tx,
-        "key": event.key,
-        "value": _serialize_value(event.value),
+        "seq": event.seq,
+        "changes": {k: _serialize_value(v) for k, v in event.changes.items()},
         "timestamp": event.timestamp.isoformat(),
-        "final": final
     }
 
 
 def _deserialize_event(raw: dict) -> Event:
     return Event(
-        tx=raw["tx"],
-        key=raw["key"],
-        value=_deserialize_value(raw["value"]),
+        seq=raw["seq"],
+        changes={k: _deserialize_value(v) for k, v in raw["changes"].items()},
         timestamp=datetime.fromisoformat(raw["timestamp"]),
     )
 
 
 def _read_intact(path: Path) -> tuple[list[Event], int]:
     events: list[Event] = []
-    pending: list[Event] = []
-    bytes_read = 0
     committed_bytes = 0
 
     if path.exists():
@@ -54,30 +49,20 @@ def _read_intact(path: Path) -> tuple[list[Event], int]:
                 if not line.endswith(b"\n"):
                     break
                 try:
-                    raw = json.loads(line)
-                    event = _deserialize_event(raw)
-                    final = raw["final"]
+                    event = _deserialize_event(json.loads(line))
                 except (json.JSONDecodeError, KeyError):
                     break
-
-                pending.append(event)
-                bytes_read += len(line)
-
-                if final:
-                    events.extend(pending)
-                    pending.clear()
-                    committed_bytes = bytes_read
+                events.append(event)
+                committed_bytes += len(line)
 
     return events, committed_bytes
 
 
-def append_batches(path: Path, batches: Iterable[list[Event]]):
+def append_events(path: Path, events: Iterable[Event]):
     with open(path, "a") as f:
-        for batch in batches:
-            for i, event in enumerate(batch):
-                final = i == len(batch) - 1
-                f.write(json.dumps(_serialize_event(event, final)))
-                f.write("\n")
+        for event in events:
+            f.write(json.dumps(_serialize_event(event)))
+            f.write("\n")
         f.flush()
         os.fsync(f.fileno())
 

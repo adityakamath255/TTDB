@@ -1,4 +1,5 @@
 from typing import Iterable, Iterator
+from datetime import datetime
 
 import immutables
 
@@ -15,5 +16,11 @@ def diff(
             yield (k, a_val, b_val)
 
 
-def history(events: Iterable[Event], key: str) -> Iterator[Event]:
-    return (e for e in events if e.key == key)
+def history(
+    events: Iterable[Event], key: str
+) -> Iterator[tuple[int, OptValue, datetime]]:
+    return (
+        (e.seq, e.changes[key], e.timestamp)
+        for e in events
+        if key in e.changes
+    )

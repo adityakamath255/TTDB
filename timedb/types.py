@@ -26,7 +26,7 @@ class Event:
     timestamp: datetime
 
 
-def fold_event(root: immutables.Map, event: Event) -> immutables.Map:
+def _fold_event(root: immutables.Map, event: Event) -> immutables.Map:
     if event.value is not ABSENT:
         return root.set(event.key, event.value)
     elif event.key in root:
@@ -36,4 +36,4 @@ def fold_event(root: immutables.Map, event: Event) -> immutables.Map:
 
 
 def fold_batch(root: immutables.Map, batch: Iterable[Event]) -> immutables.Map:
-    return reduce(fold_event, batch, root)
+    return reduce(_fold_event, batch, root)

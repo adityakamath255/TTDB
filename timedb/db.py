@@ -1,13 +1,15 @@
 import fcntl
 import os
+from bisect import bisect_left, bisect_right
 from datetime import datetime
 from pathlib import Path
-from typing import Iterator, Iterable, Optional, Sequence
+from typing import Iterator, Iterable, Optional, Sequence, Callable
+from itertools import accumulate, groupby, islice, takewhile
 
 import immutables
 
-from .types import Event, OptValue, ABSENT, EMPTY
-from .log import Log, DurableLog
+from .types import Event, OptValue, EMPTY, fold_batch
+from . import journal
 
 
 def _acquire_lock(path: Path) -> int:
@@ -26,88 +28,121 @@ def _release_lock(fd: int):
 
 
 class TimeDB:
-    def __init__(self, log: Log):
-        self._log = log
+    def __init__(self, events: Iterable[Event] = ()):
+        self._events = list(events)
+        batches = [
+            list(g) 
+            for _, g in groupby(self._events, key=lambda e: e.tx)
+        ]
+        self._roots = list(accumulate(batches, fold_batch, initial=EMPTY))
+        self._tx_timestamps = [b[0].timestamp for b in batches]
 
     @staticmethod
     def open_readonly(path: str | Path) -> "TimeDB":
-        return TimeDB(Log.open(Path(path)))
+        return TimeDB(journal.read(Path(path)))
 
     @staticmethod
     def in_memory() -> "WritableTimeDB":
-        return WritableTimeDB(Log.in_memory())
+        return WritableTimeDB()
 
     @staticmethod
-    def open(path: str | Path) -> "DurableTimeDB":
-        path = Path(path)
-        lock_fd = _acquire_lock(path)
-        try:
-            log = DurableLog.open(path)
-        except BaseException:
-            _release_lock(lock_fd)
-            raise
-        return DurableTimeDB(log, lock_fd)
+    def open(log_path: str | Path) -> "DurableTimeDB":
+        return DurableTimeDB(Path(log_path))
 
-    def at(self, tx: int) -> immutables.Map:
-        n = self._log.num_transactions()
+    def _validate_tx(self, tx: int):
+        n = self.num_transactions()
         if not (0 <= tx < n):
             raise ValueError(
                 f"invalid transaction {tx}: log has {n} transactions"
             )
-        return self._log.states()[tx + 1]
+
+    def _scan_from(
+        self, tx_lo: int, predicate: Callable[[Event], bool]
+    ) -> Iterator[Event]:
+        lo = bisect_left(self._events, tx_lo, key=lambda e: e.tx)
+        return takewhile(predicate, islice(self._events, lo, None))
+
+    def num_transactions(self) -> int:
+        return len(self._tx_timestamps)
+
+    def at(self, tx: int) -> immutables.Map:
+        self._validate_tx(tx)
+        return self._roots[tx + 1]
 
     def latest(self) -> immutables.Map:
-        return self.at(self._log.num_transactions() - 1)
+        return self._roots[self.num_transactions()]
 
     def as_of(self, t: datetime) -> immutables.Map:
-        tx = self._log.last_tx(t)
-        return EMPTY if tx is None else self.at(tx)
+        return self._roots[bisect_right(self._tx_timestamps, t)]
 
     def events(self) -> Sequence[Event]:
-        return self._log.events()
+        return self._events
 
     def events_at(self, tx: int) -> Iterator[Event]:
-        if not 0 <= tx < self._log.num_transactions():
-            raise ValueError(f"Transaction {tx} does not exist")
-        return self._log.events_at(tx)
+        self._validate_tx(tx)
+        return self._scan_from(tx, lambda e: e.tx == tx)
 
-    def between(self, tx0: int, tx1: int) -> Iterator[Event]:
-        n = self._log.num_transactions()
-        if not (0 <= tx0 <= tx1 <= n):
+    def between(self, tx_lo: int, tx_hi: int) -> Iterator[Event]:
+        n = self.num_transactions()
+        if not (0 <= tx_lo <= tx_hi <= n):
             raise ValueError(
-                f"invalid range: tx0={tx0}, tx1={tx1}, "
+                f"invalid range: tx_lo={tx_lo}, tx_hi={tx_hi}, "
                 f"log has {n} transactions"
             )
-        return self._log.events_between(tx0, tx1)
+        return self._scan_from(tx_lo, lambda e: e.tx < tx_hi)
 
     def tx_timestamp(self, tx: int) -> datetime:
-        if not 0 <= tx < self._log.num_transactions():
-            raise ValueError(f"Transaction {tx} does not exist")
-        return self._log.tx_timestamp(tx)
+        self._validate_tx(tx)
+        return self._tx_timestamps[tx]
 
     def __repr__(self) -> str:
-        n = self._log.num_transactions()
+        n = self.num_transactions()
         return f"TimeDB({n} {'transactions' if n != 1 else 'transaction'})"
 
 
 class WritableTimeDB(TimeDB):
+    def _on_batch(self, batch: list[Event]):
+        pass
+
     def apply(
         self, writes: dict[str, OptValue], at: Optional[datetime] = None
     ) -> int:
+        if not writes:
+            raise ValueError("apply called with no writes")
         if at is None:
             at = datetime.now()
-        return self._log.append(writes, at)
+        if self._events and at < self._events[-1].timestamp:
+            raise ValueError(
+                f"timestamp {at.isoformat()} is before last "
+                f"event timestamp {self._events[-1].timestamp.isoformat()}"
+            )
+        tx = self.num_transactions()
+        batch = [Event(tx, k, v, at) for k, v in writes.items()]
+        self._events.extend(batch)
+        self._roots.append(fold_batch(self._roots[-1], batch))
+        self._tx_timestamps.append(at)
+        self._on_batch(batch)
+        return tx
 
 
 class DurableTimeDB(WritableTimeDB):
-    _log: DurableLog
+    def __init__(self, log_path: Path):
+        self._log_path = log_path
+        self._pending: list[list[Event]] = []
+        self._lock_fd = _acquire_lock(self._log_path)
+        try:
+            super().__init__(journal.read_and_recover(self._log_path))
+        except BaseException:
+            _release_lock(self._lock_fd)
+            raise
 
-    def __init__(self, log: DurableLog, lock_fd: int):
-        super().__init__(log)
-        self._lock_fd = lock_fd
+    def _on_batch(self, batch: list[Event]):
+        self._pending.append(batch)
 
     def save(self):
-        self._log.save()
+        if self._pending:
+            journal.append_batches(self._log_path, self._pending)
+            self._pending.clear()
 
     def __enter__(self) -> "DurableTimeDB":
         return self
@@ -117,17 +152,3 @@ class DurableTimeDB(WritableTimeDB):
             self.save()
         finally:
             _release_lock(self._lock_fd)
-
-
-def diff(
-    a: immutables.Map, b: immutables.Map
-) -> Iterator[tuple[str, OptValue, OptValue]]:
-    for k in set(a) | set(b):
-        a_val = a.get(k, ABSENT)
-        b_val = b.get(k, ABSENT)
-        if a_val != b_val:
-            yield (k, a_val, b_val)
-
-
-def history(events: Iterable[Event], key: str) -> Iterator[Event]:
-    return (e for e in events if e.key == key)

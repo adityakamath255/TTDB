@@ -3,7 +3,8 @@ from datetime import datetime
 import json
 import os
 from pathlib import Path
-from collections.abc import Iterable, Iterator, Sequence, Mapping
+from collections.abc import Iterable, Iterator, Mapping
+from types import MappingProxyType
 import fcntl
 from bisect import bisect_right
 from itertools import accumulate
@@ -11,154 +12,119 @@ from itertools import accumulate
 import immutables
 
 
-class Absent:
-    pass
-
-
-ABSENT = Absent()
-
-Value = str | int | float | bool | None
-OptValue = Value | Absent
+Value = str | int | float | bool
+State = immutables.Map[str, Value]
 
 
 @dataclass(frozen=True, slots=True)
 class Event:
     seq: int
-    changes: Mapping[str, OptValue]
-    timestamp: datetime
+    sets: Mapping[str, Value]
+    deletes: tuple[str, ...]
+    ts: datetime
 
 
-def _fold_event(root: immutables.Map, event: Event) -> immutables.Map:
-    new = root.mutate()
-    for k, v in event.changes.items():
-        if v is ABSENT:
-            if k in new:
-                del new[k]
-        else:
-            new[k] = v
+def _fold_event(state: State, event: Event) -> State:
+    new = state.mutate()
+    for k, v in event.sets.items():
+        new[k] = v
+    for k in event.deletes:
+        new.pop(k, None)
     return new.finish()
 
 
-def _serialize_value(value: OptValue) -> dict:
-    if value is not ABSENT:
-        return {"type": "data", "data": value}
-    else:
-        return {"type": "absent"}
-
-
-def _deserialize_value(raw: dict) -> OptValue:
-    if raw["type"] != "absent":
-        return raw["data"]
-    else:
-        return ABSENT
-
-
 def _serialize_event(event: Event) -> dict:
-    return {
-        "seq": event.seq,
-        "changes": {k: _serialize_value(v) for k, v in event.changes.items()},
-        "timestamp": event.timestamp.isoformat(),
-    }
+    out = {"seq": event.seq, "ts": event.ts.isoformat()}
+    if event.sets:
+        out["sets"] = event.sets
+    if event.deletes:
+        out["deletes"] = event.deletes
+    return out
 
 
 def _deserialize_event(raw: dict) -> Event:
     return Event(
         seq=raw["seq"],
-        changes={k: _deserialize_value(v) for k, v in raw["changes"].items()},
-        timestamp=datetime.fromisoformat(raw["timestamp"]),
+        sets=raw.get("sets", {}),
+        deletes=tuple(raw.get("deletes", ())),
+        ts=datetime.fromisoformat(raw["ts"]),
     )
 
 
-def _read_intact(path: Path) -> tuple[list[Event], int]:
+def _read(path: Path, recover: bool) -> list[Event]:
     events: list[Event] = []
-    committed_bytes = 0
-
-    with path.open("rb") as f:
+    consumed = 0
+    mode = "r+b" if recover else "rb"
+    with path.open(mode) as f:
         for line in f:
             if not line.endswith(b"\n"):
                 break
             try:
                 event = _deserialize_event(json.loads(line))
-            except (json.JSONDecodeError, KeyError):
+            except (json.JSONDecodeError, KeyError, ValueError):
                 break
             events.append(event)
-            committed_bytes += len(line)
-
-    return events, committed_bytes
-
-
-def _read_and_recover(path: Path) -> list[Event]:
-    events, consumed = _read_intact(path)
-    if path.exists():
-        with path.open("r+b") as f:
+            consumed += len(line)
+        if recover:
             f.truncate(consumed)
     return events
 
 
-def _read(path: Path) -> list[Event]:
-    return _read_intact(path)[0]
-
-
-def _acquire_lock(path: Path) -> int:
-    fd = os.open(str(path), os.O_WRONLY | os.O_CREAT, 0o644)
+def _open_locked(path: Path) -> int:
+    fd = os.open(str(path), os.O_RDONLY | os.O_CREAT, 0o644)
     try:
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except BlockingIOError:
+    except BlockingIOError as e:
         os.close(fd)
-        raise RuntimeError(f"database at {path} is locked by another process")
+        raise RuntimeError(f"DB at {path} is locked by another process") from e
     return fd
 
 
-def _release_lock(fd: int):
-    fcntl.flock(fd, fcntl.LOCK_UN)
-    os.close(fd)
-
-
 def diff(
-    a: immutables.Map, b: immutables.Map
-) -> Iterator[tuple[str, OptValue, OptValue]]:
+    a: State, b: State
+) -> Iterator[tuple[str, Value | None, Value | None]]:
     for k in set(a) | set(b):
-        a_val = a.get(k, ABSENT)
-        b_val = b.get(k, ABSENT)
+        a_val = a.get(k)
+        b_val = b.get(k)
         if a_val != b_val:
             yield (k, a_val, b_val)
 
 
 def history(
     events: Iterable[Event], key: str
-) -> Iterator[tuple[int, OptValue, datetime]]:
-    return (
-        (e.seq, e.changes[key], e.timestamp)
-        for e in events
-        if key in e.changes
-    )
+) -> Iterator[tuple[int, Value | None, datetime]]:
+    for e in events:
+        if key in e.sets:
+            yield (e.seq, e.sets[key], e.ts)
+        elif key in e.deletes:
+            yield (e.seq, None, e.ts)
 
 
 class DB:
     def __init__(self, events: Iterable[Event] = ()):
         self._events = list(events)
-        self._roots = list(
+        self._states = list(
             accumulate(self._events, _fold_event, initial=immutables.Map())
         )
 
-    def at(self, seq: int) -> immutables.Map:
+    def at(self, seq: int) -> State:
         n = len(self._events)
         if not (0 <= seq < n):
-            raise ValueError(
-                f"invalid seq {seq}: log has {n} events"
-            )
-        return self._roots[seq + 1]
+            raise ValueError(f"invalid seq {seq}: log has {n} events")
+        return self._states[seq + 1]
 
-    def latest(self) -> immutables.Map:
-        return self._roots[-1]
+    def latest(self) -> State:
+        return self._states[-1]
 
-    def as_of(self, t: datetime) -> immutables.Map:
-        return self._roots[
-            bisect_right(self._events, t, key=lambda e: e.timestamp)
-        ]
+    def as_of(self, t: datetime) -> State:
+        ix = bisect_right(self._events, t, key=lambda e: e.ts)
+        return self._states[ix]
 
-    def events(self) -> Sequence[Event]:
-        return self._events
+    def events(self) -> tuple[Event, ...]:
+        return tuple(self._events)
+
+    def num_events(self) -> int:
+        return len(self._events)
 
 
 class WritableDB(DB):
@@ -166,20 +132,36 @@ class WritableDB(DB):
         pass
 
     def apply(
-        self, changes: dict[str, OptValue], at: datetime | None = None
+        self,
+        sets: Mapping[str, Value] = {},  # noqa
+        *,
+        deletes: Iterable[str] = (),
+        at: datetime | None = None,
     ) -> Event:
+        deletes = tuple(deletes)
+        if overlap := sets.keys() & set(deletes):
+            raise ValueError(f"keys cannot be both set and deleted: {overlap}")
+
+        last = self._events[-1].ts if self._events else None
         if at is None:
-            at = datetime.now()
-        if self._events and at < self._events[-1].timestamp:
+            now = datetime.now()
+            ts = max(now, last) if last else now
+        elif last and at < last:
             raise ValueError(
                 f"timestamp {at.isoformat()} is before last "
-                f"event timestamp {self._events[-1].timestamp.isoformat()}"
+                f"event timestamp {last.isoformat()}"
             )
-        seq = len(self._events)
-        event = Event(seq, dict(changes), at)
-        new_root = _fold_event(self._roots[-1], event)
+        else:
+            ts = at
+
+        event = Event(
+            seq=self.num_events(), 
+            sets=MappingProxyType(dict(sets)), 
+            deletes=deletes, ts=ts,
+        )
+        state = _fold_event(self._states[-1], event)
         self._events.append(event)
-        self._roots.append(new_root)
+        self._states.append(state)
         self._on_event(event)
         return event
 
@@ -188,13 +170,13 @@ class DurableDB(WritableDB):
     def __init__(self, log_path: Path):
         self._log_path = log_path
         self._pending = bytearray()
-        self._lock_fd = _acquire_lock(self._log_path)
+        self._lock_fd = _open_locked(self._log_path)
         try:
-            super().__init__(_read_and_recover(self._log_path))
+            super().__init__(_read(log_path, recover=True))
         except BaseException:
-            _release_lock(self._lock_fd)
+            os.close(self._lock_fd)
             raise
-
+ 
     def _on_event(self, event: Event):
         encoded = json.dumps(_serialize_event(event)).encode() + b"\n"
         self._pending.extend(encoded)
@@ -214,7 +196,7 @@ class DurableDB(WritableDB):
         try:
             self.save()
         finally:
-            _release_lock(self._lock_fd)
+            os.close(self._lock_fd)
 
 
 def open(log_path: str | Path) -> DurableDB:
@@ -223,10 +205,8 @@ def open(log_path: str | Path) -> DurableDB:
 
 def view(path: str | Path) -> DB:
     path = Path(path)
-    if not path.exists():
-        raise FileNotFoundError(path)
-    return DB(_read(path))
+    return DB(_read(path, recover=False))
 
 
-def empty() -> WritableDB:
+def in_memory() -> WritableDB:
     return WritableDB()

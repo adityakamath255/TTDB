@@ -10,8 +10,6 @@ All writes go into a log of `Event` objects, each carrying a sequence number, a 
 
 A *transaction* is one `apply` call producing one event. Multiple keys in the same `apply` share that event. Atomicity is per-event, by construction. There is no separate "single write" code path: a one-key write is just the N=1 case of a multi-key write.
 
-Deletion is a write of the sentinel value `ABSENT`, which also represents "never existed." One sentinel covers both cases; if you need to distinguish them, walk the event history.
-
 State views are plain `immutables.Map` instances (HAMTs). Each event produces a new root by folding its changes into the prior root; structural sharing keeps every root cheap. Roots are cached, one per event plus an empty root at index 0. Lookups are O(log n); time-travel to a known sequence is O(1).
 
 ## The capability ladder
@@ -80,7 +78,7 @@ snap = db.at(1)        # state after the second event
 snap = db.latest()     # state after all events
 ```
 
-`at(seq)` is the state after event `seq`, symmetric with `events()[seq]` — both index the same event. Valid range is `[0, len(db.events()))`; `at(len(db.events()) - 1)` equals `latest()`. The empty pre-state is not addressable via `at`; reach it with `as_of(t)` for any `t` earlier than every event.
+`at(seq)` is the state after event `seq`, symmetric with `events()[seq]` — both index the same event. Valid range is `[0, len(db.events()))`; `at(len(db.events()) - 1)` equals `latest()`. The empty pre-state is not addressable via `at`; reach it with timedb.EMPTY.
 
 By timestamp:
 
@@ -106,7 +104,7 @@ Deletion:
 ```python
 from timedb import ABSENT
 
-db.apply({"user.name": ABSENT})
+db.apply(deletes=["user.name"]})
 print(db.latest().get("user.name"))  # None (key absent)
 ```
 
@@ -135,7 +133,7 @@ for key, before, after in diff(db.at(0), db.latest()):
     print(key, before, after)
 ```
 
-`diff(a, b)` yields `(key, value_in_a, value_in_b)` for every key where the two snapshots disagree. `ABSENT` represents "not present in this snapshot."
+`diff(a, b)` yields `(key, value_in_a, value_in_b)` for every key where the two snapshots disagree. `None` represents "not present in this snapshot."
 
 ### History of a key
 
@@ -158,7 +156,7 @@ Both `diff` and `history` are module-level rather than methods. They operate on 
 
 ## Values
 
-Accepted value types are JSON primitives only: `str`, `int`, `float`, `bool`, `None`. The `Value` type alias encodes this exactly. Validation happens at type-check time, not runtime; pass anything other than a `Value` and pyright or mypy will reject the call.
+Accepted value types are: `str`, `int`, `float`, `bool`. The `Value` type alias encodes this exactly. Validation happens at type-check time, not runtime; pass anything other than a `Value` and pyright or mypy will reject the call.
 
 Two constraints drove the choice. The journal is JSONL and must stay readable from any language. And in a versioned store, composite values fight the grain: mutating one element of a stored list or dict is read-modify-write, every change re-serializes the whole composite into the journal, and `diff`/`history` lose granularity (a changed element shows up as "the whole list changed"). Nested entity data flattens to namespaced keys (`user.address.street`, etc.); opaque blobs can JSON-stringify into a `str`.
 

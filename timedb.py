@@ -3,8 +3,8 @@ from datetime import datetime
 import json
 import os
 from pathlib import Path
-from collections.abc import Iterable, Iterator, Mapping
-from types import MappingProxyType
+from collections.abc import Iterable, Iterator, Sequence, Mapping
+from typing import Any
 import fcntl
 from bisect import bisect_right
 from itertools import accumulate
@@ -14,6 +14,8 @@ import immutables
 
 Value = str | int | float | bool
 State = immutables.Map[str, Value]
+
+EMPTY: State = immutables.Map()
 
 
 @dataclass(frozen=True, slots=True)
@@ -33,8 +35,8 @@ def _fold_event(state: State, event: Event) -> State:
     return new.finish()
 
 
-def _serialize_event(event: Event) -> dict:
-    out = {"seq": event.seq, "ts": event.ts.isoformat()}
+def _serialize_event(event: Event) -> dict[str, Any]:
+    out: dict[str, Any] = {"seq": event.seq, "ts": event.ts.isoformat()}
     if event.sets:
         out["sets"] = event.sets
     if event.deletes:
@@ -42,7 +44,7 @@ def _serialize_event(event: Event) -> dict:
     return out
 
 
-def _deserialize_event(raw: dict) -> Event:
+def _deserialize_event(raw: dict[str, Any]) -> Event:
     return Event(
         seq=raw["seq"],
         sets=raw.get("sets", {}),
@@ -103,9 +105,7 @@ def history(
 class DB:
     def __init__(self, events: Iterable[Event] = ()):
         self._events = list(events)
-        self._states = list(
-            accumulate(self._events, _fold_event, initial=immutables.Map())
-        )
+        self._states = list(accumulate(events, _fold_event, initial=EMPTY))
 
     def at(self, seq: int) -> State:
         n = len(self._events)
@@ -120,11 +120,8 @@ class DB:
         ix = bisect_right(self._events, t, key=lambda e: e.ts)
         return self._states[ix]
 
-    def events(self) -> tuple[Event, ...]:
-        return tuple(self._events)
-
-    def num_events(self) -> int:
-        return len(self._events)
+    def events(self) -> Sequence[Event]:
+        return self._events
 
 
 class WritableDB(DB):
@@ -138,6 +135,11 @@ class WritableDB(DB):
         deletes: Iterable[str] = (),
         at: datetime | None = None,
     ) -> Event:
+        if isinstance(deletes, str):
+            raise TypeError(
+                f"delete must be a collections of strings, not a single str; "
+                f"got {deletes!r}"
+            )
         deletes = tuple(deletes)
         if overlap := sets.keys() & set(deletes):
             raise ValueError(f"keys cannot be both set and deleted: {overlap}")
@@ -154,11 +156,7 @@ class WritableDB(DB):
         else:
             ts = at
 
-        event = Event(
-            seq=self.num_events(), 
-            sets=MappingProxyType(dict(sets)), 
-            deletes=deletes, ts=ts,
-        )
+        event = Event(len(self._events), dict(sets), deletes, ts)
         state = _fold_event(self._states[-1], event)
         self._events.append(event)
         self._states.append(state)
@@ -167,45 +165,49 @@ class WritableDB(DB):
 
 
 class DurableDB(WritableDB):
-    def __init__(self, log_path: Path):
-        self._log_path = log_path
+    def __init__(self, path: Path, flush_threshold_bytes: int):
+        self._path = path
         self._pending = bytearray()
-        self._lock_fd = _open_locked(self._log_path)
+        self._flush_threshold = flush_threshold_bytes
+        self._lock_fd = _open_locked(self._path)
         try:
-            super().__init__(_read(log_path, recover=True))
+            super().__init__(_read(path, recover=True))
         except BaseException:
-            os.close(self._lock_fd)
+            self.close()
             raise
  
     def _on_event(self, event: Event):
         encoded = json.dumps(_serialize_event(event)).encode() + b"\n"
         self._pending.extend(encoded)
+        if len(self._pending) >= self._flush_threshold:
+            self.flush()
 
-    def save(self):
-        if self._pending:
-            with self._log_path.open("ab") as f:
-                f.write(self._pending)
-                f.flush()
-                os.fsync(f.fileno())
-            self._pending.clear()
+    def flush(self):
+        with self._path.open("ab") as f:
+            f.write(self._pending)
+            f.flush()
+            os.fsync(f.fileno())
+        self._pending.clear()
+
+    def close(self):
+        os.close(self._lock_fd)
 
     def __enter__(self) -> "DurableDB":
         return self
 
     def __exit__(self, *exc):
         try:
-            self.save()
+            self.flush()
         finally:
-            os.close(self._lock_fd)
+            self.close()
 
 
-def open(log_path: str | Path) -> DurableDB:
-    return DurableDB(Path(log_path))
+def connect(path: str | Path, flush_threshold_bytes: int = 1) -> DurableDB:
+    return DurableDB(Path(path), flush_threshold_bytes)
 
 
-def view(path: str | Path) -> DB:
-    path = Path(path)
-    return DB(_read(path, recover=False))
+def inspect(path: str | Path) -> DB:
+    return DB(_read(Path(path), recover=False))
 
 
 def in_memory() -> WritableDB:

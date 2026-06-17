@@ -12,45 +12,45 @@ from itertools import accumulate
 import immutables
 
 
-Value = str | int | float | bool
-State = immutables.Map[str, Value]
+type Value = str | int | float | bool
+type Change = Value | None
+type State = immutables.Map[str, Value]
 
 EMPTY: State = immutables.Map()
 
 
 @dataclass(frozen=True, slots=True)
 class Event:
-    seq: int
-    sets: Mapping[str, Value]
-    deletes: tuple[str, ...]
+    changes: Mapping[str, Change]
     ts: datetime
 
 
 def _fold_event(state: State, event: Event) -> State:
     new = state.mutate()
-    for k, v in event.sets.items():
-        new[k] = v
-    for k in event.deletes:
-        new.pop(k, None)
+    for k, change in event.changes.items():
+        if change is None:
+            new.pop(k, None)
+        else:
+            new[k] = change
     return new.finish()
 
 
 def _serialize_event(event: Event) -> dict[str, Any]:
-    out: dict[str, Any] = {"seq": event.seq, "ts": event.ts.isoformat()}
-    if event.sets:
-        out["sets"] = event.sets
-    if event.deletes:
-        out["deletes"] = event.deletes
+    out: dict[str, Any] = {"ts": event.ts.isoformat()}
+    if event.changes:
+        out["changes"] = dict(event.changes)
     return out
 
 
 def _deserialize_event(raw: dict[str, Any]) -> Event:
     return Event(
-        seq=raw["seq"],
-        sets=raw.get("sets", {}),
-        deletes=tuple(raw.get("deletes", ())),
+        changes=raw.get("changes", {}),
         ts=datetime.fromisoformat(raw["ts"]),
     )
+
+
+def _encode(event: Event) -> bytes:
+    return json.dumps(_serialize_event(event)).encode() + b"\n"
 
 
 def _read(path: Path, recover: bool) -> list[Event]:
@@ -82,6 +82,18 @@ def _open_locked(path: Path) -> int:
     return fd
 
 
+def _resolve_ts(at: datetime | None, last: datetime | None) -> datetime:
+    if at is None:
+        now = datetime.now()
+        return max(now, last) if last else now
+    if last and at < last:
+        raise ValueError(
+            f"timestamp {at.isoformat()} is before last "
+            f"event timestamp {last.isoformat()}"
+        )
+    return at
+
+
 def diff(
     a: State, b: State
 ) -> Iterator[tuple[str, Value | None, Value | None]]:
@@ -95,16 +107,14 @@ def diff(
 def history(
     events: Iterable[Event], key: str
 ) -> Iterator[tuple[int, Value | None, datetime]]:
-    for e in events:
-        if key in e.sets:
-            yield (e.seq, e.sets[key], e.ts)
-        elif key in e.deletes:
-            yield (e.seq, None, e.ts)
+    for seq, e in enumerate(events):
+        if key in e.changes:
+            yield (seq, e.changes[key], e.ts)
 
 
 class DB:
-    def __init__(self, events: Iterable[Event] = ()):
-        self._events = list(events)
+    def __init__(self, events: list[Event]):
+        self._events = events
         self._states = list(accumulate(events, _fold_event, initial=EMPTY))
 
     def at(self, seq: int) -> State:
@@ -125,85 +135,56 @@ class DB:
 
 
 class WritableDB(DB):
-    def _on_event(self, event: Event):
+    def _persist(self, event: Event) -> None:
         pass
 
     def apply(
         self,
-        sets: Mapping[str, Value] = {},  # noqa
+        sets: Mapping[str, Change] = {},
         *,
-        deletes: Iterable[str] = (),
         at: datetime | None = None,
-    ) -> Event:
-        if isinstance(deletes, str):
-            raise TypeError(
-                f"delete must be a collections of strings, not a single str; "
-                f"got {deletes!r}"
-            )
-        deletes = tuple(deletes)
-        if overlap := sets.keys() & set(deletes):
-            raise ValueError(f"keys cannot be both set and deleted: {overlap}")
-
+    ) -> int:
+        """Assign each key its value; assigning None deletes the key."""
         last = self._events[-1].ts if self._events else None
-        if at is None:
-            now = datetime.now()
-            ts = max(now, last) if last else now
-        elif last and at < last:
-            raise ValueError(
-                f"timestamp {at.isoformat()} is before last "
-                f"event timestamp {last.isoformat()}"
-            )
-        else:
-            ts = at
+        ts = _resolve_ts(at, last)
+        event = Event(dict(sets), ts)
 
-        event = Event(len(self._events), dict(sets), deletes, ts)
-        state = _fold_event(self._states[-1], event)
+        self._persist(event)
+
+        seq = len(self._events)
         self._events.append(event)
-        self._states.append(state)
-        self._on_event(event)
-        return event
+        self._states.append(_fold_event(self._states[-1], event))
+        return seq
 
 
 class DurableDB(WritableDB):
-    def __init__(self, path: Path, flush_threshold_bytes: int):
+    def __init__(self, path: Path):
         self._path = path
-        self._pending = bytearray()
-        self._flush_threshold = flush_threshold_bytes
         self._lock_fd = _open_locked(self._path)
         try:
             super().__init__(_read(path, recover=True))
         except BaseException:
             self.close()
             raise
- 
-    def _on_event(self, event: Event):
-        encoded = json.dumps(_serialize_event(event)).encode() + b"\n"
-        self._pending.extend(encoded)
-        if len(self._pending) >= self._flush_threshold:
-            self.flush()
 
-    def flush(self):
+    def _persist(self, event: Event) -> None:
         with self._path.open("ab") as f:
-            f.write(self._pending)
+            f.write(_encode(event))
             f.flush()
             os.fsync(f.fileno())
-        self._pending.clear()
 
-    def close(self):
+    def close(self) -> None:
         os.close(self._lock_fd)
 
     def __enter__(self) -> "DurableDB":
         return self
 
-    def __exit__(self, *exc):
-        try:
-            self.flush()
-        finally:
-            self.close()
+    def __exit__(self, *exc) -> None:
+        self.close()
 
 
-def connect(path: str | Path, flush_threshold_bytes: int = 1) -> DurableDB:
-    return DurableDB(Path(path), flush_threshold_bytes)
+def connect(path: str | Path) -> DurableDB:
+    return DurableDB(Path(path))
 
 
 def inspect(path: str | Path) -> DB:
@@ -211,4 +192,4 @@ def inspect(path: str | Path) -> DB:
 
 
 def in_memory() -> WritableDB:
-    return WritableDB()
+    return WritableDB([])

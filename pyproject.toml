@@ -1,5 +1,5 @@
 [project]
-name = "time-travel-db"
+name = "tiny-time-travel-db"
 version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"

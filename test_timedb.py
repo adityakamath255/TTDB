@@ -4,9 +4,9 @@ from datetime import datetime, timedelta
 import pytest
 
 from timedb import (
-    EMPTY,
     DB,
     Event,
+    _EMPTY as EMPTY,
     _deserialize_event,
     _fold_event,
     _serialize_event,
@@ -53,9 +53,10 @@ class TestSerialization:
         assert raw["changes"]["d"] is None
         assert _deserialize_event(json.loads(json.dumps(raw))) == e
 
-    def test_empty_changes_omitted(self):
+    def test_changes_serialized(self):
         raw = _serialize_event(ev())
-        assert "changes" not in raw
+        assert "changes" in raw
+        assert "ts" in raw
         assert _deserialize_event(raw) == ev()
 
 
@@ -119,9 +120,9 @@ class TestReadOnly:
 
 
 class TestApply:
-    def test_returns_sequential_seqs_and_updates_state(self):
+    def test_returns_sequential_lengths_and_updates_state(self):
         db = in_memory()
-        assert (db.apply({"a": 1}), db.apply({"b": 2})) == (0, 1)
+        assert (db.apply({"a": 1}), db.apply({"b": 2})) == (1, 2)
         assert dict(db.latest()) == {"a": 1, "b": 2}
 
     def test_delete_via_none(self):
@@ -139,7 +140,7 @@ class TestApply:
     def test_explicit_timestamp_and_monotonic_guard(self):
         db = in_memory()
         db.apply({"a": 1}, at=datetime(2024, 6, 1))
-        db.apply({"b": 2}, at=datetime(2024, 6, 1))  # equal allowed
+        db.apply({"b": 2}, at=datetime(2024, 6, 1))
         with pytest.raises(ValueError):
             db.apply({"c": 3}, at=datetime(2024, 5, 1))
 
@@ -158,14 +159,14 @@ class TestDurable:
         log = tmp_path / "db.log"
         with connect(log) as db:
             db.apply({"a": 1})
-            assert log.read_text() != ""  # no buffer: on disk at once
+            assert log.read_text() != ""
 
     def test_seq_continues_across_reopen(self, tmp_path):
         log = tmp_path / "db.log"
         with connect(log) as db:
             db.apply({"a": 1})
         with connect(log) as db:
-            assert db.apply({"b": 2}) == 1
+            assert db.apply({"b": 2}) == 2
 
     def test_one_json_object_per_line(self, tmp_path):
         log = tmp_path / "db.log"
@@ -186,7 +187,7 @@ class TestRecovery:
         log = tmp_path / "db.log"
         self._seed(log)
         with log.open("a") as f:
-            f.write('{"changes": {"b": 2}, "ts": "2024-06-01T00:00:00"')  # no \n
+            f.write('{"changes": {"b": 2}, "ts": "2024-06-01T00:00:00"')
         with connect(log) as db:
             assert dict(db.latest()) == {"a": 1}
             db.apply({"b": 2})
@@ -215,7 +216,8 @@ class TestLocking:
         log = tmp_path / "db.log"
         with connect(log):
             with pytest.raises(RuntimeError, match="locked"):
-                connect(log)
+                with connect(log):
+                    pass
 
     def test_lock_released_on_exit(self, tmp_path):
         log = tmp_path / "db.log"
@@ -230,13 +232,13 @@ class TestInspect:
         log = tmp_path / "db.log"
         with connect(log) as db:
             db.apply({"a": 1})
-            v = inspect(log)  # readable while writer holds the lock
+            v = inspect(log)
             assert v.latest()["a"] == 1
         with log.open("a") as f:
-            f.write("torn line")  # no newline
+            f.write("torn line")
         size = log.stat().st_size
         assert dict(inspect(log).latest()) == {"a": 1}
-        assert log.stat().st_size == size  # inspect never repairs
+        assert log.stat().st_size == size
 
     def test_missing_file_raises(self, tmp_path):
         with pytest.raises(FileNotFoundError):

@@ -1,31 +1,32 @@
-from dataclasses import dataclass
-from datetime import datetime
+import fcntl
 import json
 import os
-from pathlib import Path
-from collections.abc import Iterable, Iterator, Sequence, Mapping
-from typing import Any
-import fcntl
 from bisect import bisect_right
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
+from contextlib import contextmanager
+from dataclasses import dataclass
+from datetime import datetime
 from itertools import accumulate
+from pathlib import Path
+from typing import Any
 
 import immutables
 
 
 type Value = str | int | float | bool
-type Change = Value | None
-type State = immutables.Map[str, Value]
 
-EMPTY: State = immutables.Map()
+_EMPTY: immutables.Map[str, Value] = immutables.Map()
 
 
 @dataclass(frozen=True, slots=True)
 class Event:
-    changes: Mapping[str, Change]
+    changes: Mapping[str, Value | None]
     ts: datetime
 
 
-def _fold_event(state: State, event: Event) -> State:
+def _fold_event(
+    state: immutables.Map[str, Value], event: Event
+) -> immutables.Map[str, Value]:
     new = state.mutate()
     for k, change in event.changes.items():
         if change is None:
@@ -35,16 +36,16 @@ def _fold_event(state: State, event: Event) -> State:
     return new.finish()
 
 
-def _serialize_event(event: Event) -> dict[str, Any]:
-    out: dict[str, Any] = {"ts": event.ts.isoformat()}
-    if event.changes:
-        out["changes"] = dict(event.changes)
-    return out
+def _serialize_event(event: Event) -> Mapping[str, Any]:
+    return {
+        "changes": event.changes,
+        "ts": event.ts.isoformat()
+    }
 
 
-def _deserialize_event(raw: dict[str, Any]) -> Event:
+def _deserialize_event(raw: Mapping[str, Any]) -> Event:
     return Event(
-        changes=raw.get("changes", {}),
+        changes=raw["changes"],
         ts=datetime.fromisoformat(raw["ts"]),
     )
 
@@ -53,7 +54,7 @@ def _encode(event: Event) -> bytes:
     return json.dumps(_serialize_event(event)).encode() + b"\n"
 
 
-def _read(path: Path, recover: bool) -> list[Event]:
+def _read(path: Path, recover: bool) -> Sequence[Event]:
     events: list[Event] = []
     consumed = 0
     mode = "r+b" if recover else "rb"
@@ -95,7 +96,7 @@ def _resolve_ts(at: datetime | None, last: datetime | None) -> datetime:
 
 
 def diff(
-    a: State, b: State
+    a: Mapping, b: Mapping
 ) -> Iterator[tuple[str, Value | None, Value | None]]:
     for k in set(a) | set(b):
         a_val = a.get(k)
@@ -113,78 +114,52 @@ def history(
 
 
 class DB:
-    def __init__(self, events: list[Event]):
-        self._events = events
-        self._states = list(accumulate(events, _fold_event, initial=EMPTY))
+    def __init__(self, events: Sequence[Event]):
+        self._events = list(events)
+        self._states = list(accumulate(events, _fold_event, initial=_EMPTY))
 
-    def at(self, seq: int) -> State:
+    def at(self, seq: int) -> Mapping:
         n = len(self._events)
         if not (0 <= seq < n):
             raise ValueError(f"invalid seq {seq}: log has {n} events")
         return self._states[seq + 1]
 
-    def latest(self) -> State:
+    def latest(self) -> Mapping:
         return self._states[-1]
 
-    def as_of(self, t: datetime) -> State:
-        ix = bisect_right(self._events, t, key=lambda e: e.ts)
-        return self._states[ix]
+    def seq_as_of(self, t: datetime) -> int | None:
+        ix = bisect_right(self._events, t, key=lambda e: e.ts) - 1
+        return ix if ix >= 0 else None
+
+    def as_of(self, t: datetime) -> Mapping:
+        seq = self.seq_as_of(t)
+        return self.at(seq) if seq is not None else _EMPTY
 
     def events(self) -> Sequence[Event]:
         return self._events
 
 
 class WritableDB(DB):
-    def _persist(self, event: Event) -> None:
-        pass
+    def __init__(
+        self, events: Sequence[Event], on_apply: Callable[[Event], None]
+    ):
+        super().__init__(events)
+        self._on_apply = on_apply
 
+    # assigning None deletes the key
     def apply(
-        self,
-        sets: Mapping[str, Change] = {},
-        *,
-        at: datetime | None = None,
+        self, 
+        changes: Mapping[str, Value | None], 
+        *, 
+        at: datetime | None = None
     ) -> int:
-        """Assign each key its value; assigning None deletes the key."""
         last = self._events[-1].ts if self._events else None
         ts = _resolve_ts(at, last)
-        event = Event(dict(sets), ts)
-
-        self._persist(event)
-
-        seq = len(self._events)
+        event = Event(dict(changes), ts)
+        self._on_apply(event)
         self._events.append(event)
         self._states.append(_fold_event(self._states[-1], event))
-        return seq
-
-
-class DurableDB(WritableDB):
-    def __init__(self, path: Path):
-        self._path = path
-        self._lock_fd = _open_locked(self._path)
-        try:
-            super().__init__(_read(path, recover=True))
-        except BaseException:
-            self.close()
-            raise
-
-    def _persist(self, event: Event) -> None:
-        with self._path.open("ab") as f:
-            f.write(_encode(event))
-            f.flush()
-            os.fsync(f.fileno())
-
-    def close(self) -> None:
-        os.close(self._lock_fd)
-
-    def __enter__(self) -> "DurableDB":
-        return self
-
-    def __exit__(self, *exc) -> None:
-        self.close()
-
-
-def connect(path: str | Path) -> DurableDB:
-    return DurableDB(Path(path))
+        return len(self._events)
 
 
 def inspect(path: str | Path) -> DB:
@@ -192,4 +167,19 @@ def inspect(path: str | Path) -> DB:
 
 
 def in_memory() -> WritableDB:
-    return WritableDB([])
+    return WritableDB([], lambda _: None)
+
+
+@contextmanager
+def connect(path: str | Path) -> Iterator[WritableDB]:
+    path = Path(path)
+    def persist(event: Event) -> None:
+        with path.open("ab") as f:
+            f.write(_encode(event))
+            f.flush()
+            os.fsync(f.fileno())
+    lock_fd = _open_locked(path)
+    try:
+        yield WritableDB(_read(path, recover=True), persist)
+    finally:
+        os.close(lock_fd)

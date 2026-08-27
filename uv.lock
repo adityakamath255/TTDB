@@ -70,7 +70,7 @@ wheels = [
 ]
 
 [[package]]
-name = "time-travel-db"
+name = "ttdb"
 version = "0.1.0"
 source = { virtual = "." }
 dependencies = [

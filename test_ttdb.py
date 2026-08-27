@@ -1,15 +1,12 @@
 import json
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta, timezone
 
 import pytest
 
-from timedb import (
+from ttdb import (
+    CorruptJournal,
     DB,
     Event,
-    _EMPTY as EMPTY,
-    _deserialize_event,
-    _fold_event,
-    _serialize_event,
     connect,
     diff,
     history,
@@ -17,25 +14,28 @@ from timedb import (
     inspect,
 )
 
-T0 = datetime(2024, 1, 1, 12, 0, 0)
+T0 = datetime(2024, 1, 1, 12, 0, 0, tzinfo=UTC)
 
 
 def ev(changes=(), ts=T0):
     return Event(changes=dict(changes), ts=ts)
 
 
-class TestFold:
+class TestSnapshots:
     def test_set_overwrite_delete(self):
-        s = _fold_event(EMPTY, ev({"a": 1, "b": 2}))
-        s = _fold_event(s, ev({"a": 99, "b": None}))
-        assert dict(s) == {"a": 99}
+        db = DB([ev({"a": 1, "b": 2}), ev({"a": 99, "b": None})])
+        assert dict(db.latest()) == {"a": 99}
 
     def test_delete_missing_is_noop(self):
-        assert dict(_fold_event(EMPTY, ev({"gone": None}))) == {}
+        db = in_memory()
+        db.apply({"gone": None})
+        assert dict(db.latest()) == {}
 
     def test_does_not_mutate_input(self):
-        root = _fold_event(EMPTY, ev({"a": 1}))
-        _fold_event(root, ev({"a": 2}))
+        db = in_memory()
+        db.apply({"a": 1})
+        root = db.latest()
+        db.apply({"a": 2})
         assert dict(root) == {"a": 1}
 
 
@@ -43,27 +43,39 @@ class TestSerialization:
     @pytest.mark.parametrize(
         "value", ["hi", "", "世界", 0, -17, 3.14, True, False]
     )
-    def test_value_round_trip(self, value):
-        e = ev({"k": value})
-        assert _deserialize_event(_serialize_event(e)).changes["k"] == value
+    def test_value_round_trip(self, tmp_path, value):
+        log = tmp_path / "db.log"
+        with connect(log) as db:
+            db.apply({"k": value}, at=T0)
 
-    def test_delete_round_trips_as_null(self):
-        e = ev({"d": None}, ts=datetime(2024, 6, 15, 10, 30, 45))
-        raw = _serialize_event(e)
-        assert raw["changes"]["d"] is None
-        assert _deserialize_event(json.loads(json.dumps(raw))) == e
+        reopened = inspect(log)
+        assert reopened.latest()["k"] == value
+        assert reopened.events()[0].changes["k"] == value
 
-    def test_changes_serialized(self):
-        raw = _serialize_event(ev())
-        assert "changes" in raw
-        assert "ts" in raw
-        assert _deserialize_event(raw) == ev()
+    def test_delete_round_trips_as_null(self, tmp_path):
+        log = tmp_path / "db.log"
+        with connect(log) as db:
+            db.apply({"d": 1}, at=T0)
+            db.apply({"d": None}, at=T0)
+
+        reopened = inspect(log)
+        assert "d" not in reopened.latest()
+        assert reopened.events()[1].changes["d"] is None
+
+    def test_journal_record_has_documented_envelope(self, tmp_path):
+        log = tmp_path / "db.log"
+        with connect(log) as db:
+            db.apply({}, at=T0)
+
+        raw = json.loads(log.read_text())
+        assert set(raw) == {"changes", "ts"}
+        assert inspect(log).events() == (ev(),)
 
 
 class TestDiff:
     def test_add_remove_change(self):
-        a = EMPTY.set("keep", 1).set("drop", 2).set("chg", 3)
-        b = EMPTY.set("keep", 1).set("chg", 99).set("new", 4)
+        a = {"keep": 1, "drop": 2, "chg": 3}
+        b = {"keep": 1, "chg": 99, "new": 4}
         assert set(diff(a, b)) == {
             ("drop", 2, None),
             ("chg", 3, 99),
@@ -71,7 +83,7 @@ class TestDiff:
         }
 
     def test_identical_is_empty(self):
-        m = EMPTY.set("a", 1)
+        m = {"a": 1}
         assert list(diff(m, m)) == []
 
 
@@ -106,17 +118,35 @@ class TestReadOnly:
     def test_empty_db(self):
         db = DB([])
         assert dict(db.latest()) == {}
-        assert dict(db.as_of(datetime.now())) == {}
+        assert dict(db.as_of(datetime.now(UTC))) == {}
         with pytest.raises(ValueError):
             db.at(0)
 
     def test_as_of_is_inclusive_and_bisects(self):
-        t1, t2 = datetime(2024, 1, 1), datetime(2024, 1, 3)
+        t1 = datetime(2024, 1, 1, tzinfo=UTC)
+        t2 = datetime(2024, 1, 3, tzinfo=UTC)
         db = DB([ev({"a": 1}, ts=t1), ev({"b": 2}, ts=t2)])
         assert dict(db.as_of(t1 - timedelta(days=1))) == {}
         assert dict(db.as_of(t1)) == {"a": 1}
-        assert dict(db.as_of(datetime(2024, 1, 2))) == {"a": 1}
+        assert dict(db.as_of(datetime(2024, 1, 2, tzinfo=UTC))) == {"a": 1}
         assert dict(db.as_of(t2)) == {"a": 1, "b": 2}
+
+    def test_event_does_not_retain_caller_mapping(self):
+        changes = {"a": 1}
+        db = DB([Event(changes=changes, ts=T0)])
+
+        changes["a"] = 2
+
+        assert db.events()[0].changes["a"] == 1
+        assert db.latest()["a"] == 1
+
+    def test_returned_events_cannot_change_db_history(self):
+        db = self.make()
+        returned = db.events()
+
+        assert isinstance(returned, tuple)
+        assert len(db.events()) == 2
+        assert dict(db.latest()) == {"a": "v1", "b": 2}
 
 
 class TestApply:
@@ -132,17 +162,39 @@ class TestApply:
         assert "a" not in db.latest()
 
     def test_default_timestamp_is_now(self):
-        before = datetime.now()
+        before = datetime.now(UTC)
         db = in_memory()
         db.apply({"a": 1})
-        assert before <= db.events()[0].ts <= datetime.now()
+        assert before <= db.events()[0].ts <= datetime.now(UTC)
 
     def test_explicit_timestamp_and_monotonic_guard(self):
         db = in_memory()
-        db.apply({"a": 1}, at=datetime(2024, 6, 1))
-        db.apply({"b": 2}, at=datetime(2024, 6, 1))
+        db.apply({"a": 1}, at=datetime(2024, 6, 1, tzinfo=UTC))
+        db.apply({"b": 2}, at=datetime(2024, 6, 1, tzinfo=UTC))
         with pytest.raises(ValueError):
-            db.apply({"c": 3}, at=datetime(2024, 5, 1))
+            db.apply({"c": 3}, at=datetime(2024, 5, 1, tzinfo=UTC))
+
+    @pytest.mark.parametrize("value", [[], float("nan"), float("inf")])
+    def test_rejects_invalid_value_before_changing_state(self, value):
+        db = in_memory()
+
+        with pytest.raises(ValueError):
+            db.apply({"bad": value})
+
+        assert dict(db.latest()) == {}
+
+    def test_rejects_naive_timestamp(self):
+        with pytest.raises(ValueError, match="timezone-aware"):
+            in_memory().apply({"a": 1}, at=datetime(2024, 6, 1))
+
+    def test_normalizes_explicit_timestamp_to_utc(self):
+        db = in_memory()
+        ist = timezone(timedelta(hours=5, minutes=30))
+
+        db.apply({"a": 1}, at=datetime(2024, 6, 1, 12, tzinfo=ist))
+
+        assert db.events()[0].ts == datetime(2024, 6, 1, 6, 30, tzinfo=UTC)
+        assert db.events()[0].ts.tzinfo is UTC
 
 
 class TestDurable:
@@ -194,14 +246,24 @@ class TestRecovery:
         with connect(log) as db:
             assert dict(db.latest()) == {"a": 1, "b": 2}
 
-    @pytest.mark.parametrize("garbage", ["not json\n", '{"only": "x"}\n'])
-    def test_unparsable_trailing_line_ignored(self, tmp_path, garbage):
+    @pytest.mark.parametrize(
+        "garbage",
+        ["not json\n", f'{{"changes": [], "ts": "{T0.isoformat()}"}}\n'],
+    )
+    def test_complete_corrupt_line_is_reported_and_preserved(
+        self, tmp_path, garbage
+    ):
         log = tmp_path / "db.log"
         self._seed(log)
         with log.open("a") as f:
             f.write(garbage)
-        with connect(log) as db:
-            assert dict(db.latest()) == {"a": 1}
+        contents = log.read_text()
+
+        with pytest.raises(CorruptJournal, match="line 2"):
+            with connect(log):
+                pass
+
+        assert log.read_text() == contents
 
     def test_torn_first_line_yields_empty(self, tmp_path):
         log = tmp_path / "db.log"
